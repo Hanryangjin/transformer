@@ -7,19 +7,19 @@ from typing import Optional, Tuple
 # 
 class DotProductAttention(nn.Module):
     r"""
-    Args: dim, mask
-        dim (int): dimension of attention
-        mask (torch.Tensor): tensor containing indices to be masked
+    Args: dim, scale
+        dim (int): attention 차원
+        scale (bool, optional): attenion에 스케일 적용 여부
 
     Inputs: query, key, value, mask
-        - **query** (batch, q_len, d_model): tensor containing projection vector for decoders.
-        - **key** (batch, k_len, d_model): tensor containing projection vector for encoders.
-        - **value** (batch, v_len, d_model): tensor containing features of the encoded input sequence.
-        - **mask** (-): tensor containing indices to be masked
+        - query (torch.FloatTensor): Query값 - 입력 X에 대한 완전연결층 출력
+        - key (torch.FloatTensor): Key값 - 입력 X에 대한 완전연결층 출력
+        - value (torch.FloatTensor): Value값 - 입력 X에 대한 완전연결층 출력
+        - mask (Optional[torch.FloatTensor], optional): Mask 적용 여부
 
     Returns: context, attn
-        - **context**: tensor containing the context vector from attention mechanism.
-        - **attn**: tensor containing the attention (alignment) from the encoders outputs.
+        - context: attention 연산 결과
+        - attn: attention matrix
     """
     def __init__(self, dim: int, scale: bool = True) -> None:
         super(DotProductAttention, self).__init__()
@@ -42,7 +42,7 @@ class DotProductAttention(nn.Module):
 
         attn = F.softmax(score, -1)
 
-        # product = attn @ v
+        # query 차원에 따라 attn @ v 계산
         if len(query.size()) == 3:
             context = torch.bmm(attn, value)
         else:
@@ -57,22 +57,20 @@ class MultiHeadAttention(nn.Module):
         where head_i = Attention(Q · W_q, K · W_k, V · W_v)
 
     Args:
-        dim (int): The dimension of model (default: 512)
-        num_attention_heads (int): The number of attention heads. (default: 8)
+        dim (int): attention 차원
+        num_attention_heads (int): attention head 수
 
     Inputs: query, key, value, mask
-        - **query** (batch, q_len, d_model): tensor containing projection vector for decoders.
-        - **key** (batch, k_len, d_model): tensor containing projection vector for encoders.
-        - **value** (batch, v_len, d_model): tensor containing features of the encoded input sequence.
-        - **mask** (-): tensor containing indices to be masked
+        - query (torch.FloatTensor[batch, q_len, d_model]): Query값 - 입력 X에 대한 완전연결층 출력
+        - key (torch.FloatTensor[batch, k_len, d_model]): Key값 - 입력 X에 대한 완전연결층 출력
+        - value (torch.FloatTensor[batch, v_len, d_model]): Value값 - 입력 X에 대한 완전연결층 출력
+        - mask (Optional[torch.FloatTensor], optional): Mask 적용 여부
 
     Returns: output, attn
-        - **output** (batch, output_len, dimensions): tensor containing the attended output features.
-        - **attn** (batch * num_attention_heads, v_len): tensor containing the attention (alignment) from the encoders outputs.
+        - **output** (batch, output_len, dimensions): attention 연산 결과
+        - **attn** (batch * num_attention_heads, v_len): attention matrix
     """
-    def __init__(self, dim: int = 512,
-                 num_attention_heads: int = 8
-    ) -> None:
+    def __init__(self, dim: int, num_attention_heads: int) -> None:
         super(MultiHeadAttention, self).__init__()
 
         assert dim % num_attention_heads == 0, "d_model % num_attention_heads 가 0이 아님"

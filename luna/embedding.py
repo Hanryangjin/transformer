@@ -16,7 +16,32 @@ class PositionalEncoding(nn.Module):
 
     def forward(self, length: int) -> Tensor:
         return self.pe[:, :length]
-    
+
+class TextEmbedding(nn.Module):
+    def __init__(self, d_model, vocab_size, max_len, device, dropout=0.1):
+        super(TextEmbedding, self).__init__()
+        self.tok_embedding = nn.Embedding(vocab_size, d_model)
+        self.positional_encoding = PositionalEncoding(d_model, max_len, device)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x):
+        # 입력 텐서를 long 타입으로 변환
+        if x.dtype != torch.long:
+            x = x.long()
+        
+        # 디버깅용 출력
+        print(f"\n최대 인덱스: {x.max().item()}")
+        print(f"임베딩 사이즈: {self.tok_embedding.num_embeddings}")
+        
+        # 토큰 임베딩: [batch_size, seq_len] -> [batch_size, seq_len, d_model]
+        tok_embedding = self.tok_embedding(x)
+        
+        # 위치 인코딩: [batch_size, seq_len, d_model]
+        positional_encoding = self.positional_encoding(x)
+        
+        # 두 임베딩을 더하고 드롭아웃 적용
+        return self.dropout(tok_embedding + positional_encoding)
+
 """
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len, device):
