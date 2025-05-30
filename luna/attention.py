@@ -72,7 +72,7 @@ class MultiHeadAttention(nn.Module):
     """
     def __init__(self, dim: int, num_attention_heads: int) -> None:
         super(MultiHeadAttention, self).__init__()
-
+        # 차원이 나누어 떨어지지 않으면 오류 발생
         assert dim % num_attention_heads == 0, "d_model % num_attention_heads 가 0이 아님"
 
         self.d_head = int(dim / num_attention_heads)
@@ -91,15 +91,16 @@ class MultiHeadAttention(nn.Module):
     ) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
         batch_size = value.size(0)
 
+        # 선형변환 후 batch_size, num_attention_heads, d_head 차원으로 나누기
         query = self.query_proj(query).view(batch_size, -1, self.num_attention_heads, self.d_head).transpose(1, 2)
         key = self.key_proj(key).view(batch_size, -1, self.num_attention_heads, self.d_head).transpose(1, 2)
         value = self.value_proj(value).view(batch_size, -1, self.num_attention_heads, self.d_head).transpose(1, 2)
 
+        # mask 적용
         if mask is not None:
             mask = mask.unsqueeze(1).repeat(1, self.num_attention_heads, 1, 1)
 
         context, attn = self.scaled_dot_attn(query, key, value, mask)
-
         context = context.transpose(1, 2).reshape(batch_size, -1, self.num_attention_heads * self.d_head)
 
         return context, attn

@@ -25,14 +25,12 @@ class LunaTransformerEncoder(nn.Module):
         
         # projected embeddings 초기화
         self.projected_embeddings = nn.Parameter(torch.Tensor(project_embedding_length, self.d_model))
-        nn.init.normal_(self.projected_embeddings, mean=0.0, std=self.d_model ** -0.5)
-
-        # positional encoding 초기화
         self.projected_positions = PositionalEncoding(
             d_model=self.d_model,
             max_length=project_embedding_length,
             device=self.device
         )
+        nn.init.normal_(self.projected_embeddings, mean=0.0, std=self.d_model ** -0.5)
         
         self.input_embedding = nn.Embedding(vocab_size, d_model)
         self.dropout = nn.Dropout(p=dropout_p)
@@ -60,9 +58,11 @@ class LunaTransformerEncoder(nn.Module):
 
         embedded = self.input_embedding(inputs)
 
+        # input embedding 및 projected embedding(Packed Matrix) 스케일링
         embedded *= self.embed_scale
         projected_embedded = self.projected_embeddings * self.embed_scale
 
+        # input embedding 및 projected embedding 위치 인코딩
         embedded += self.input_positions(embedded.size(1))
         projected_embedded += self.projected_positions(self.projected_embedding_length).squeeze(0)
 

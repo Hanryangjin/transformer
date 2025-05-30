@@ -17,7 +17,7 @@ drive_path = "/content/drive/Othercomputers/학교 컴/대학원 과목/[Coding]
 from transformer.luna.model import LunaTransformerEncoder, EditBasedLunaModel
 from transformer.code_transformer.dataset import SpellingDataset
 from transformer.code_transformer.sentencepiece_tokenizer import SentencePieceTokenizer
-#from transformer.code_transformer.WeightedCELossForGEC import WeightedCELossForGEC
+from transformer.code_transformer.WeightedCELossForGEC import WeightedCELossForGEC
 from transformer.code_transformer.EditBasedLoss import EditBasedLoss
 from transformer.code_transformer.EditBasedDecoder import EditBasedDecoder
 
