@@ -2,7 +2,7 @@ import math
 import torch
 import torch.nn as nn
 
-from transformer.luna.embedding import PositionalEncoding, TextEmbedding
+from transformer.luna.embedding import PositionalEncoding
 from transformer.luna.encoder import LunaTransformerEncoderLayer
 from transformer.luna.mask import get_attn_pad_mask
 
