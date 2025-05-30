@@ -105,7 +105,6 @@ class MultiHeadAttention(nn.Module):
 
         return context, attn
 
-
 class PackNUnpackAttention(nn.Module):
     def __init__(self, dim, num_attention_heads: int = 8) -> None:
         super(PackNUnpackAttention, self).__init__()

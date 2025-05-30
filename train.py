@@ -17,7 +17,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 
-from code_transformer.model import Transformer
+from basic_transformer.model import Transformer
 from code_transformer.dataset import SpellingDataset
 
 # 새로운 손실 함수 클래스 정의
