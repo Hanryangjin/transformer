@@ -5,6 +5,7 @@ import torch.nn as nn
 from transformer.luna.embedding import PositionalEncoding
 from transformer.luna.encoder import LunaTransformerEncoderLayer
 from transformer.luna.mask import get_attn_pad_mask
+from transformer.code_transformer.transformer import DecoderBlock
 
 class LunaTransformerEncoder(nn.Module):
     def __init__(
@@ -76,6 +77,50 @@ class LunaTransformerEncoder(nn.Module):
             outputs, p = layer(outputs, p, attention_padding_mask)
 
         return outputs
+
+class LunaTransformer(nn.Module):
+    def __init__(
+            self,
+            vocab_size: int,
+            d_model: int,
+            num_layers: int = 6,
+            num_attention_heads: int = 8,
+            d_ff: int = 2048,
+            dropout_p: float = 0.1,
+            project_embedding_length: int = 32,
+            max_length: int = 1024,
+    ):
+        self.encoder_layers = nn.ModuleList([
+            LunaTransformerEncoder(vocab_size, d_model, num_layers, num_attention_heads,
+                                   d_ff, dropout_p, project_embedding_length, max_length,)
+            #for _ in range(num_layers)
+        ])
+        self.decoder_layers = nn.ModuleList([
+            DecoderBlock(d_model, num_attention_heads, d_ff, dropout_p)
+            for _ in range(num_layers)
+        ])
+        
+        self.final_layer = nn.Linear(d_model, vocab_size)
+        
+
+    def forward(self, src, src_lengths, tgt):
+        # 임베딩
+        tgt_emb = self.embedding(tgt)
+        
+        # 인코더
+        enc_input = src
+        for layer in self.encoder_layers:
+            enc_output = layer(enc_input, src_lengths)
+        
+        # 디코더
+        dec_output = tgt_emb
+        for layer in self.decoder_layers:
+            dec_output = layer(dec_output, enc_output)
+        
+        # 출력층
+        output = self.final_layer(dec_output)
+        
+        return output 
 
 class EditOperationPredictor(nn.Module):
     def __init__(self, d_model, num_operations=4):
