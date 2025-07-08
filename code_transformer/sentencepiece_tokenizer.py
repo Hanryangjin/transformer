@@ -141,7 +141,12 @@ class SentencePieceTokenizer:
     
     def convert_ids_to_tokens(self, ids):
         """ID를 토큰으로 변환하는 함수"""
-        return [self.tokenizer.id_to_piece(id) for id in ids] 
+        return [self.tokenizer.id_to_piece(id) for id in ids]
+    
+    def get_piece_size(self):
+        """어휘 크기(토큰 수)를 반환하는 함수"""
+        # SentencePieceProcessor에는 piece_size() 메서드가 있습니다.
+        return self.tokenizer.piece_size()
 
 #transformer_path = "D:\\김태호\\대학원 과목\\[Coding]\\transformer"
 #sp = SentencePieceTokenizer(os.path.join(transformer_path, 'TrainData/combined_train_dataset.json'), vocab_size=16000, max_length=256)

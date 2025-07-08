@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
-from .attention import MultiHeadAttention
-from .attention import _Embedding
-from .attention import FeedForward
+from transformer.basic_transformer.attention import MultiHeadAttention
+from transformer.basic_transformer.attention import _Embedding
+from transformer.basic_transformer.attention import FeedForward
 import math
 
 class EncoderBlock(nn.Module):
