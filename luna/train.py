@@ -101,14 +101,9 @@ def train():
 
     # 데이터셋 및 데이터로더 설정
     transformer_path = "/content/drive/Othercomputers/학교 컴/대학원 과목/[Coding]/transformer"
-
     train_path = os.path.join(transformer_path, 'TrainData/combined_train_dataset.json')
     val_path = os.path.join(transformer_path, 'ValidationData/combined_validation_dataset.json')
-
-    # 토크나이저 초기화
     tokenizer = SentencePieceTokenizer(train_path, vocab_size=VOCAB_SIZE, max_length=max_length).tokenizer
-
-    # 데이터셋 및 데이터로더 설정
     dataset = SpellingDataset(train_path, val_path, tokenizer, max_length)
     train_loader = DataLoader(dataset.train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     checkpoints = [f for f in os.listdir(f"{drive_path}/transformer/checkpoints") if f.endswith('.pt')]
@@ -125,13 +120,10 @@ def train():
     )
     model = model.to(device)
 
-    # 손실 함수 및 옵티마이저 설정
-    criterion = nn.CrossEntropyLoss()
+    # 손실 함수 및 옵티마이저 학습률 스케줄러 설정
+    criterion = nn.CrossEntropyLoss(ignore_index=PAD_TOKEN_ID)
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     scaler = GradScaler()  # FP16을 위한 Gradient Scaler
-    
-    # 학습률 스케줄러 설정
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=2, verbose=True
     )
@@ -158,6 +150,13 @@ def train():
     for epoch in range(latest_checknum, EPOCHS + latest_checknum):
         total_loss = 0
         total_edit_ratio = 0
+        
+        total_gold_edits = 0
+        total_pred_edits = 0
+        correct_edit_total = 0
+        correct_tokens = 0
+        total_tokens = 0
+        
         progress_bar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{EPOCHS+latest_checknum}')
         
         for batch_idx, batch in enumerate(progress_bar):
@@ -166,16 +165,23 @@ def train():
             output_ids = batch['output_ids'].to(device)
             
             # input_lengths 계산 (패딩 토큰 0을 제외한 실제 길이)
-            input_lengths = (input_ids != 0).sum(dim=1).to(device)
+            input_lengths = (input_ids != PAD_TOKEN_ID).sum(dim=1).to(device)
 
+            decoder_input = output_ids[:, :-1]  # Decoder 입력
+            target = output_ids[:, 1:]          # 정답
+            
             optimizer.zero_grad()
 
-            with autocast():  # 자동 혼합 정밀도 (FP16)
+            with autocast():  # 자동 혼합 정밀도 (FP16)      
+                outputs = model(input_ids, input_lengths, decoder_input)
+                outputs = outputs.view(-1, outputs.size(-1))
+                target = target.contiguous().view(-1)
+                """
                 outputs = model(input_ids, input_lengths, output_ids)
                 outputs = outputs.view(-1, outputs.size(-1))  # (batch_size * seq_len, vocab_size)
                 target = output_ids.view(-1)  # (batch_size * seq_len)
+                """
                 loss = criterion(outputs, target)
-                #loss = criterion(outputs, output_ids, input_ids)
 
             # FP16 학습을 위한 스케일링된 역전파
             scaler.scale(loss).backward()
@@ -187,6 +193,27 @@ def train():
             total_edit_ratio += edit_ratio
 
             total_loss += loss.item()
+            
+            # 예측
+            pred_ids = outputs.argmax(dim=-1)
+
+            # 수정 비율
+            edit_ratio = ((output_ids != input_ids) & (output_ids != PAD_TOKEN_ID)).float().mean().item()
+            total_edit_ratio += edit_ratio
+
+            # 정확도 계산용
+            correct_tokens += ((pred_ids == target) & (target != PAD_TOKEN_ID)).sum().item()
+            total_tokens += (target != PAD_TOKEN_ID).sum().item()
+
+            # 편집 정확도
+            gold_edits = ((output_ids[:, 1:] != input_ids[:, 1:]) & (output_ids[:, 1:] != PAD_TOKEN_ID))
+            pred_edits = ((pred_ids != input_ids[:, 1:]) & (pred_ids != PAD_TOKEN_ID))
+            correct_edits = ((pred_ids == output_ids[:, 1:]) & gold_edits)
+
+            total_gold_edits += gold_edits.sum().item()
+            total_pred_edits += pred_edits.sum().item()
+            correct_edit_total += correct_edits.sum().item()
+            
             progress_bar.set_postfix({
                 'loss': f'{loss.item():.4f}',
                 #'edit_ratio': f'{edit_ratio:.2f}'
@@ -195,6 +222,10 @@ def train():
             # 샘플 출력 (각 에포크마다 5개)
             if batch_idx < 5:
                 try:
+                    input_text = safe_decode(tokenizer, input_ids[0].cpu().tolist())
+                    output_text = safe_decode(tokenizer, output_ids[0].cpu().tolist())
+                    pred_text = safe_decode(tokenizer, pred_ids[0].cpu().tolist())
+                    """
                     # 배치의 첫 번째 샘플 선택
                     input_sample = input_ids[0].cpu().numpy().tolist()
                     output_sample = batch['output_ids'][0].cpu().numpy().tolist()
@@ -213,7 +244,7 @@ def train():
                     input_text = input_text.replace('<pad>', '').strip()
                     output_text = output_text.replace('<pad>', '').strip()
                     pred_text = pred_text.replace('<pad>', '').strip()
-
+                    """
                     # 샘플 출력
                     print(f"\n\t샘플 {batch_idx+1}:")
                     print(f"\t> 입력: {input_text}")
@@ -225,7 +256,20 @@ def train():
 
         avg_loss = total_loss / len(train_loader)
         avg_edit_ratio = total_edit_ratio / len(train_loader)
-        print(f"Epoch {epoch+1}, Average Loss: {avg_loss:.4f}, Average Edit Ratio: {avg_edit_ratio:.4f}")
+        
+        token_acc = correct_tokens / total_tokens if total_tokens > 0 else 0.0
+
+        precision = correct_edit_total / total_pred_edits if total_pred_edits > 0 else 0.0
+        recall = correct_edit_total / total_gold_edits if total_gold_edits > 0 else 0.0
+        beta = 0.5
+        if precision + recall > 0:
+            f0_5 = (1 + beta**2) * precision * recall / (beta**2 * precision + recall)
+        else:
+            f0_5 = 0.0
+
+        print(f"Epoch {epoch+1}, Avg Loss: {avg_loss:.4f}, Avg Edit Ratio: {avg_edit_ratio:.4f}")
+        print(f"   Token Acc: {token_acc:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F0.5: {f0_5:.4f}")
+        #print(f"Epoch {epoch+1}, Average Loss: {avg_loss:.4f}, Average Edit Ratio: {avg_edit_ratio:.4f}")
         
         # 학습률 조정
         scheduler.step(avg_loss)
