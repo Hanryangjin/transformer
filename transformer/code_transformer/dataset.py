@@ -40,6 +40,10 @@ class SpellingDataset:
             # 토큰화
             input_ids = self.tokenizer.encode(input_text)
             output_ids = self.tokenizer.encode(output_text)
+
+            BOS, EOS = 2, 3
+            input_ids = [BOS] + input_ids + [EOS]
+            output_ids = [BOS] + output_ids + [EOS]
             
             # 최대 길이 제한
             if len(input_ids) > self.max_length or len(output_ids) > self.max_length:

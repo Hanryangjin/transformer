@@ -33,8 +33,14 @@ class LunaTransformerEncoder(nn.Module):
             max_length=project_embedding_length,
             device=self.device
         )
+        """
         nn.init.normal_(self.projected_embeddings, mean=0.0, std=self.d_model ** -0.5)
-        
+        # 더 안정적인 초기화
+        nn.init.xavier_uniform_(self.projected_embeddings)
+        """
+        ### 변경1. FP16 최적화
+        nn.init.kaiming_uniform_(self.projected_embeddings, a=math.sqrt(5))
+
         self.input_embedding = nn.Embedding(vocab_size, d_model)
         self.dropout = nn.Dropout(p=dropout_p)
         self.input_positions = PositionalEncoding(
@@ -53,6 +59,7 @@ class LunaTransformerEncoder(nn.Module):
                 dropout_p=dropout_p,
             ) for _ in range(num_layers)
         ])
+        self.final_layer_norm = nn.LayerNorm(self.d_model)
 
     def forward(self, inputs: torch.Tensor, input_lengths: torch.Tensor):
         batch_size, seq_length = inputs.size()
@@ -78,7 +85,8 @@ class LunaTransformerEncoder(nn.Module):
         for layer in self.layers:
             outputs, p = layer(outputs, p, attention_padding_mask)
 
-        return outputs
+        ### 변경2. 최종 출력에 정규화 레이어 추가
+        return self.final_layer_norm(outputs)
 
 class LunaTransformer(nn.Module):
     def __init__(
@@ -117,9 +125,35 @@ class LunaTransformer(nn.Module):
         dec_output = tgt_emb
         for layer in self.decoder_layers:
             dec_output = layer(dec_output, enc_output)
-        
+
         # 출력층
         output = self.final_layer(dec_output)
+
+        # [Debug]이상징후 감지 조건
+        try:
+            enc_mean = enc_output.mean().item()
+            enc_var = enc_output.var().item()
+            dec_mean = dec_output.mean().item()
+            dec_max = dec_output.max().item()
+
+            abnormal = (
+                not math.isfinite(enc_mean) or
+                not math.isfinite(enc_var) or
+                not math.isfinite(dec_mean) or
+                not math.isfinite(dec_max) or
+                abs(enc_mean) > 1e2 or
+                enc_var > 100.0 or
+                dec_max > 50.0 or
+                not torch.isfinite(output).all()
+            )
+
+            if abnormal:
+                print(f"\n[⚠️ 이상 감지] Encoder/Decoder 출력 이상!")
+                print(f"Encoder 출력 평균: {enc_mean}, 분산: {enc_var}")
+                print(f"Decoder 출력 평균: {dec_mean}, 최대: {dec_max}")
+                print(f"Output logits 예시: {output[0][:5]}")
+        except Exception as e:
+            print(f"[경고] 이상 감지 중 오류 발생: {e}")
         
         return output 
 
