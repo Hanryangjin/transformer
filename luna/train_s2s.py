@@ -347,6 +347,7 @@ class pNup_s2s:
         transformer_path = f"{drive_path}/transformer"
         train_path = os.path.join(transformer_path, 'TrainData/combined_train_dataset.json')
         val_path   = os.path.join(transformer_path, 'ValidationData/combined_validation_dataset.json')
+        printed_guard = False
 
         # ===== 토크나이저/데이터셋 =====
         tokenizer = SentencePieceTokenizer(val_path, vocab_size=self.VOCAB_SIZE, max_length=self.MAX_SEQ_LENGTH).tokenizer
@@ -511,16 +512,6 @@ class pNup_s2s:
                     bsz = input_ids.size(0)
                     # 가능한 만큼만 출력
                     take = min(N_SAMPLES - printed_examples, bsz)
-
-                    # EOS 예측률/길이
-                    eos_rate = (pred_full[:,1:] == self.EOS_TOKEN_ID).float().mean().item()
-                    print("[VAL] EOS rate(after first token):", eos_rate)
-
-                    # 입력 무시 확인: 입력을 섞어도 예측이 같은가?
-                    shuf = input_ids[torch.randperm(input_ids.size(0))]
-                    pred_shuf = free_run_generate(model, shuf, input_lengths, self.MAX_SEQ_LENGTH, self.BOS_TOKEN_ID, self.EOS_TOKEN_ID, self.PAD_TOKEN_ID)
-                    same_ratio = (pred_full == pred_shuf).float().mean().item()
-                    print("[VAL] Input-agnostic ratio:", same_ratio)
                     for i in range(take):
                         # 첫 토큰 비교(예측은 pred_full[:,1], 정답은 output_ids[:,1])
                         try:
@@ -549,6 +540,23 @@ class pNup_s2s:
                         printed_examples += 1
                         if printed_examples >= N_SAMPLES:
                             break
+
+                if not printed_guard:
+                    eos_rate = (pred_full[:, 1:] == self.EOS_TOKEN_ID).float().mean().item()
+                    print("[VAL] EOS rate(after first token):", eos_rate)
+
+                    # 입력 무시 여부를 간단히 체크(샘플 몇 개만 섞어서)
+                    idx = torch.arange(input_ids.size(0), device=input_ids.device)
+                    idx = idx[torch.randperm(idx.numel())[: min(8, idx.numel())]]
+                    pred_shuf = free_run_generate(
+                        model, input_ids[idx], (input_ids[idx] != self.PAD_TOKEN_ID).sum(1),
+                        max_len=output_ids.size(1),
+                        bos_id=self.BOS_TOKEN_ID, eos_id=self.EOS_TOKEN_ID, pad_id=self.PAD_TOKEN_ID
+                    )
+                    # EOS rate가 0에 가깝다면 EOS가 거의 안 나옴 → 디코딩 무한반복 경향
+                    same_ratio = (pred_full[idx] == pred_shuf).float().mean().item()
+                    print("[VAL] Input-agnostic ratio:", same_ratio)
+                    printed_guard = True
 
         # ===== 지표 집계 =====
         if total_tokens > 0:

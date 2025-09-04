@@ -4,7 +4,7 @@ import torch.nn as nn
 
 from transformer.luna.embedding import PositionalEncoding
 from transformer.luna.encoder import LunaTransformerEncoderLayer
-from transformer.luna.mask import get_attn_pad_mask
+from transformer.luna.mask import get_attn_pad_mask, get_attn_subsequent_mask
 from transformer.code_transformer.transformer import DecoderBlock
 from transformer.basic_transformer.attention import _Embedding
 
@@ -97,11 +97,12 @@ class LunaTransformer(nn.Module):
             d_ff: int = 2048,
             dropout_p: float = 0.1,
             project_embedding_length: int = 32,
-            max_length: int = 1024,
+            max_length: int = 128,
     ):
         super().__init__()
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
+        self.PAD_TOKEN_ID = 0
+
         self.embedding = _Embedding(d_model, vocab_size, max_length, self.device, dropout_p)
         self.encoder_layers = LunaTransformerEncoder(vocab_size, d_model, num_layers, num_attention_heads, d_ff, dropout_p, project_embedding_length, max_length)
         self.decoder_layers = nn.ModuleList([
@@ -113,17 +114,24 @@ class LunaTransformer(nn.Module):
         
     """$수정필. 디코더에 mask 삽입"""
     def forward(self, src, src_lengths, tgt):
+        B, S = src.size()
+        _, T = tgt.size()
+
         # 임베딩
         tgt_emb = self.embedding(tgt)
         
         # 인코더
         enc_input = src
         enc_output = self.encoder_layers(enc_input, src_lengths)
-        
+
+        # mask
+        enc_pad_mask = (src == self.pad_token_id)
+        tgt_mask = self._subsequent_mask(T).to(src.device)
+
         # 디코더
         dec_output = tgt_emb
         for layer in self.decoder_layers:
-            dec_output = layer(dec_output, enc_output)
+            dec_output = layer(dec_output, enc_output, enc_pad_mask, tgt_mask)
 
         # 출력층
         output = self.final_layer(dec_output)

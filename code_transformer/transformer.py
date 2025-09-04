@@ -33,7 +33,6 @@ class DecoderBlock(nn.Module):
     def __init__(self, d_model, num_heads, d_ff, dropout=0.1):
         super().__init__()
         self.self_attn = MultiHeadAttention(d_model, num_heads, dropout)
-        self.norm1 = nn.LayerNorm(d_model)
         self.cross_attn = MultiHeadAttention(d_model, num_heads, dropout)
         self.ffn = FeedForward(d_model, d_ff, dropout)
         self.norm1 = nn.LayerNorm(d_model)
