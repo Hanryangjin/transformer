@@ -175,7 +175,7 @@ class pNup_s2s:
             total_tokens = 0
             
             progress_bar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{self.EPOCHS+latest_checknum}')
-            
+
             for batch_idx, batch in enumerate(progress_bar):
                 # 배치 데이터 추출
                 input_ids = batch['input_ids'].to(device)
@@ -581,6 +581,6 @@ class pNup_s2s:
 
 if __name__ == '__main__':
     tne = pNup_s2s()
-    #train()
+    tne.train()
     tne.evaluate()
 

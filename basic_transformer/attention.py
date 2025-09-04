@@ -29,7 +29,9 @@ class MultiHeadAttention(nn.Module):
         
         # Scaled dot-product attention
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.d_k)
-        
+        """
+        print("scores", scores.shape, "mask", mask.shape)  # [디버그용]
+        """
         if mask is not None:
             scores = scores.masked_fill(mask == 0, -1e9)
         

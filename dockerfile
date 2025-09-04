@@ -24,4 +24,4 @@ CMD ["bash"]
 
 # docker exec -i -t gec-training bash
 
-# PYTHONPATH=/workspace python3 ./transformer/luna/train.py
+# PYTHONPATH=/workspace python3 ./transformer/luna/train_s2s.py

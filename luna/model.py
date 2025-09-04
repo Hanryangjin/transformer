@@ -125,8 +125,19 @@ class LunaTransformer(nn.Module):
         enc_output = self.encoder_layers(enc_input, src_lengths)
 
         # mask
-        enc_pad_mask = (src == self.pad_token_id)
-        tgt_mask = self._subsequent_mask(T).to(src.device)
+        enc_pad_mask = get_attn_pad_mask(src, src_lengths, expand_length=T)
+        enc_pad_mask  = (1.0 - enc_pad_mask.float()).unsqueeze(1)
+
+        tgt_mask = get_attn_subsequent_mask(tgt)
+        tgt_mask  = (1.0 - tgt_mask.float()).unsqueeze(1)
+        
+        """
+        # [디버그용 출력]
+        print("tgt_mask", tgt_mask.shape, tgt_mask.dtype,
+            tgt_mask.min().item(), tgt_mask.max().item())
+        print("src_mask", enc_pad_mask.shape, enc_pad_mask.dtype,
+            enc_pad_mask.min().item(), enc_pad_mask.max().item())
+        """
 
         # 디코더
         dec_output = tgt_emb
