@@ -511,6 +511,16 @@ class pNup_s2s:
                     bsz = input_ids.size(0)
                     # 가능한 만큼만 출력
                     take = min(N_SAMPLES - printed_examples, bsz)
+
+                    # EOS 예측률/길이
+                    eos_rate = (pred_full[:,1:] == self.EOS_TOKEN_ID).float().mean().item()
+                    print("[VAL] EOS rate(after first token):", eos_rate)
+
+                    # 입력 무시 확인: 입력을 섞어도 예측이 같은가?
+                    shuf = input_ids[torch.randperm(input_ids.size(0))]
+                    pred_shuf = free_run_generate(model, shuf, input_lengths, self.MAX_SEQ_LENGTH, self.BOS_TOKEN_ID, self.EOS_TOKEN_ID, self.PAD_TOKEN_ID)
+                    same_ratio = (pred_full == pred_shuf).float().mean().item()
+                    print("[VAL] Input-agnostic ratio:", same_ratio)
                     for i in range(take):
                         # 첫 토큰 비교(예측은 pred_full[:,1], 정답은 output_ids[:,1])
                         try:
