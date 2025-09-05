@@ -137,7 +137,9 @@ class pNup_s2s:
         model = model.to(device)
 
         # 손실 함수 및 옵티마이저 학습률 스케줄러 설정
-        criterion = nn.CrossEntropyLoss(ignore_index=self.PAD_TOKEN_ID)
+        weight = torch.ones(self.VOCAB_SIZE, device=device)
+        weight[self.EOS_TOKEN_ID] = 1.5  # 1.2~2.0 범위에서 탐색
+        criterion = nn.CrossEntropyLoss(ignore_index=self.PAD_TOKEN_ID, weight=weight)
         optimizer = torch.optim.AdamW(model.parameters(), lr=self.LEARNING_RATE, weight_decay=0.01)
         scaler = GradScaler()  # FP16을 위한 Gradient Scaler
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -240,10 +242,9 @@ class pNup_s2s:
                 edit_ratio = ((output_ids != input_ids) & (output_ids != self.PAD_TOKEN_ID)).float().mean().item()
                 total_edit_ratio += edit_ratio
 
-                # 정확도 계산용
+                # 정확도 계산
                 target_2d = target.view(pred_ids.size(0), pred_ids.size(1))
 
-                # 정확도 계산
                 correct_tokens += ((pred_ids == target_2d) & (target_2d != self.PAD_TOKEN_ID)).sum().item()
                 total_tokens += (target_2d != self.PAD_TOKEN_ID).sum().item()
 
@@ -425,6 +426,7 @@ class pNup_s2s:
         model.eval()
         total_loss = 0.0
         total_tokens = 0
+        total_eval_non_pad = 0
         correct_tokens = 0
 
         total_gold_edits = 0
@@ -460,7 +462,7 @@ class pNup_s2s:
 
                 input_lengths = (input_ids != self.PAD_TOKEN_ID).sum(dim=1)
 
-                # ---- (A) teacher-forcing 기반 loss만 계산 (진단용) ----
+                # ---- teacher-forcing 기반 loss만 계산 (진단용) ----
                 decoder_input = output_ids[:, :-1].contiguous()
                 target        = output_ids[:,  1:].contiguous()   # (B, T-1)
 
@@ -497,6 +499,8 @@ class pNup_s2s:
                 # 토큰 정확도는 free-running 예측 기준으로(실사용과 일치)
                 non_pad_full = (output_ids != self.PAD_TOKEN_ID)
                 correct_tokens += ((pred_full == output_ids) & non_pad_full).sum().item()
+
+                total_eval_non_pad += non_pad_full.sum().item()
 
                 # 편집 지표(입력/정답/예측을 같은 프레임에서 비교)
                 valid_mask = (output_ids != self.PAD_TOKEN_ID) & (output_ids != self.BOS_TOKEN_ID) & (output_ids != self.EOS_TOKEN_ID)
@@ -556,6 +560,23 @@ class pNup_s2s:
                     # EOS rate가 0에 가깝다면 EOS가 거의 안 나옴 → 디코딩 무한반복 경향
                     same_ratio = (pred_full[idx] == pred_shuf).float().mean().item()
                     print("[VAL] Input-agnostic ratio:", same_ratio)
+
+                    def _strip(ids, BOS, EOS, PAD):
+                        if torch.is_tensor(ids): ids = ids.tolist()
+                        if ids and ids[0] == BOS: ids = ids[1:]
+                        if EOS in ids:
+                            ids = ids[:ids.index(EOS)]
+                        return [t for t in ids if t != PAD]
+
+                    # 배치에서 4개만 샘플 비교
+                    k = min(4, pred_full.size(0))
+                    same = 0
+                    for j in range(k):
+                        a = _strip(pred_full[j], self.BOS_TOKEN_ID, self.EOS_TOKEN_ID, self.PAD_TOKEN_ID)
+                        b = _strip(pred_shuf[j], self.BOS_TOKEN_ID, self.EOS_TOKEN_ID, self.PAD_TOKEN_ID)
+                        same += 1.0 if a == b else 0.0
+                    print("[VAL] Input-agnostic (stripped) mean:", same / k)
+
                     printed_guard = True
 
         # ===== 지표 집계 =====
@@ -565,10 +586,7 @@ class pNup_s2s:
             avg_loss = float('nan')
 
         # free-running 기준 토큰 정확도/편집 지표
-        total_eval_tokens = ( (dataset.val_dataset[0]['output_ids']).__len__() )  # 사용 안 함: 아래에서 non_pad_full 합으로 계산했음
-        token_acc = correct_tokens / ( (non_pad_full).sum().item() )  # 마지막 배치의 마스크가 아니라 전체 합으로 계산해야 정확하지만,
-                                                                    # 위에서 배치별로 누적해도 동일합니다.
-
+        token_acc = correct_tokens / total_eval_non_pad if total_eval_non_pad > 0 else 0.0
         precision = (correct_edits / total_pred_edits) if total_pred_edits > 0 else 0.0
         recall    = (correct_edits / total_gold_edits) if total_gold_edits > 0 else 0.0
         beta = 0.5
@@ -581,6 +599,6 @@ class pNup_s2s:
 
 if __name__ == '__main__':
     tne = pNup_s2s()
-    tne.train()
+    #tne.train()
     tne.evaluate()
 
