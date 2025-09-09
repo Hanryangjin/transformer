@@ -43,7 +43,6 @@ def safe_decode(tokenizer, ids):
     except Exception as e:
         return f"디코딩 오류: {e}"
 
-
 # ------------------------
 # 가장 최신에 저장된 체크포인트 path 반환
 # ------------------------
@@ -117,17 +116,6 @@ def label_smoothed_loss(pred, target, epsilon=0.1, ignore_index=0, class_weight=
     loss = loss_per_tok[mask].mean()
     return loss
 
-"""
-def label_smoothed_loss(pred, target, epsilon=0.1):
-    n_class = pred.size(-1)
-    log_probs = F.log_softmax(pred, dim=-1)
-
-    one_hot = F.one_hot(target, num_classes=n_class).float()
-    smoothed_target = (1 - epsilon) * one_hot + epsilon / n_class
-
-    loss = -(smoothed_target * log_probs).sum(dim=-1)
-    return loss.mean()
-"""
 class pNup_s2s:
     def __init__(self):
         # 하이퍼파라미터 설정
@@ -173,11 +161,6 @@ class pNup_s2s:
         model = model.to(device)
 
         # 손실 함수 및 옵티마이저 학습률 스케줄러 설정
-        """
-        weight = torch.ones(self.VOCAB_SIZE, device=device)
-        weight[self.EOS_TOKEN_ID] = 1.5  # 1.2~2.0 범위에서 탐색
-        criterion = nn.CrossEntropyLoss(ignore_index=self.PAD_TOKEN_ID, weight=weight)
-        """
         optimizer = torch.optim.AdamW(model.parameters(), lr=self.LEARNING_RATE, weight_decay=0.01)
         scaler = GradScaler()  # FP16을 위한 Gradient Scaler
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -185,6 +168,7 @@ class pNup_s2s:
         )
 
         # 체크포인트 로드
+        """ $추가. 특정 체크포인트를 불러오는 함수 추가할 것 """
         if not checkpoints:
             print("저장된 체크포인트 없음.")
             latest_checknum = 0
@@ -217,6 +201,21 @@ class pNup_s2s:
             progress_bar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{self.EPOCHS+latest_checknum}')
 
             for batch_idx, batch in enumerate(progress_bar):
+                """ $수정 라인 =================================================================================== """
+                """
+                    1. Beam Search 추가.
+                    2. 길이 정규화 및 패널티 추가.
+                    3. 반복 패널티 수정(초안에서는 적용X. 필요시 추가)
+                    4. 스케줄드 샘플링 수정 및 내용 정리(3과 연계)
+                    5. 평가 방식 변경(위치별 정확도 → 편집 정확도 : 정렬기반(Levenshtein/ERRANT)으로 편집을 비교하여 P/R/F0.5 산출)
+                    6. 유지보수성 향상을 위해 함수로 분리하여 적용.
+                        - 대부분의 모델에 사용할 수 있도록 함수화
+                        - 해당 부분은 수정 라인 밖의 부분도 동일하게 적용
+                    7. 디버깅용 출력문 정리
+                        - 중간단계에서의 출력이 필수적이지 않으면 제거 또는 후방으로 이동
+                    8. 주석 정리
+                        - 함수화 할 경우, 파라미터를 명확히 주석으로 표시
+                """
                 # 배치 데이터 추출
                 input_ids = batch['input_ids'].to(device)
                 output_ids = batch['output_ids'].to(device)
@@ -315,6 +314,8 @@ class pNup_s2s:
                     'loss': f'{loss.item():.4f}',
                     #'edit_ratio': f'{edit_ratio:.2f}'
                 })
+
+                """ $수정 라인 =================================================================================== """
                 
                 # 샘플 출력 (각 에포크마다 5개)
                 if batch_idx < 5:
@@ -324,13 +325,6 @@ class pNup_s2s:
                         pred_ids_with_pad = [self.BOS_TOKEN_ID] + pred_ids[0].cpu().tolist()
                         pred_text = safe_decode(tokenizer, pred_ids_with_pad)
 
-                        # === 첫 토큰 비교 디버그 추가 ===
-                        pred_first = safe_decode(tokenizer, [pred_ids[0, 0].item()])
-                        gold_first = safe_decode(tokenizer, [output_ids[0, 1].item()])  # [BOS] 다음 토큰
-                        print(f"\t> 첫 토큰 비교 | 예측: {pred_first}-")
-                        print(f"\t> 첫 토큰 비교 | 정답: {gold_first}-")
-                        # =============================
-
                         # 샘플 출력
                         print(f"\t샘플 {batch_idx+1}:")
                         print(f"\t> 입력: {input_text}")
@@ -339,7 +333,8 @@ class pNup_s2s:
 
                     except Exception as e:
                         print(f"[Error🚨] 샘플 출력 중 오류 발생: {e}")
-
+            
+            # 에포크별 평균 손실 및 지표 계산
             avg_loss = total_loss / len(train_loader)
             avg_edit_ratio = total_edit_ratio / len(train_loader)
             
@@ -357,7 +352,8 @@ class pNup_s2s:
             print(f"   Token Acc: {token_acc:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F0.5: {f0_5:.4f}")
             #print(f"Epoch {epoch+1}, Average Loss: {avg_loss:.4f}, Average Edit Ratio: {avg_edit_ratio:.4f}")
             
-            with open(f"{transformer_path}\\epoch_metrics.csv", mode="a", newline="") as file:
+            # 에포크별 지표 수치 기록
+            with open(f"{transformer_path}/epoch_metrics.csv", mode="a", newline="") as file:
                 writer = csv.writer(file)
                 if epoch == 0:
                     writer.writerow(["epoch", "loss", "edit_ratio", "token_acc", "precision", "recall", "f0.5"])

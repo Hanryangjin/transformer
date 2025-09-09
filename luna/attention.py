@@ -8,8 +8,10 @@ from typing import Optional, Tuple
 class DotProductAttention(nn.Module):
     r"""
     Args: dim, scale
-        dim (int): attention 차원
-        scale (bool, optional): attenion에 스케일 적용 여부
+        - dim (int): attention 차원
+        - scale (bool, optional): attenion에 스케일 적용 여부
+            > True일 경우 1/sqrt(dim)로 스케일링
+            > False일 경우 스케일링하지 않음
 
     Inputs: query, key, value, mask
         - query (torch.FloatTensor): Query값 - 입력 X에 대한 완전연결층 출력
@@ -37,6 +39,7 @@ class DotProductAttention(nn.Module):
         # attention matrix 계산
         score = torch.matmul(query, key.transpose(2, 3)) / self.sqrt_dim
 
+        # mask 적용 : mask == 0 인 곳에 -1e4 부여
         if mask is not None:
             score.masked_fill_(mask, -1e4)
 
@@ -57,8 +60,8 @@ class MultiHeadAttention(nn.Module):
         where head_i = Attention(Q · W_q, K · W_k, V · W_v)
 
     Args:
-        dim (int): attention 차원
-        num_attention_heads (int): attention head 수
+        - dim (int): attention 차원
+        - num_attention_heads (int): attention head 수
 
     Inputs: query, key, value, mask
         - query (torch.FloatTensor[batch, q_len, d_model]): Query값 - 입력 X에 대한 완전연결층 출력
@@ -72,6 +75,7 @@ class MultiHeadAttention(nn.Module):
     """
     def __init__(self, dim: int, num_attention_heads: int) -> None:
         super(MultiHeadAttention, self).__init__()
+
         # 차원이 나누어 떨어지지 않으면 오류 발생
         assert dim % num_attention_heads == 0, "d_model % num_attention_heads 가 0이 아님"
 
@@ -105,8 +109,25 @@ class MultiHeadAttention(nn.Module):
 
         return context, attn
 
+"""p가 뭐였는지 확인"""
 class PackNUnpackAttention(nn.Module):
-    def __init__(self, dim, num_attention_heads: int = 8) -> None:
+    r"""
+    Args:
+        - dim (int): attention 차원
+        - num_attention_heads (int): attention head 수
+
+    Inputs: query, key, value, p, attention_padding_mask
+        - query (torch.FloatTensor[batch, q_len, d_model]): Query값 - 입력 X에 대한 완전연결층 출력
+        - key (torch.FloatTensor[batch, k_len, d_model]): Key값 - 입력 X에 대한 완전연결층 출력
+        - value (torch.FloatTensor[batch, v_len, d_model]): Value값 - 입력 X에 대한 완전연결층 출력
+        - p (torch.FloatTensor[batch, p_len, d_model]): Projected Embedding(query가 압축된 matrix)
+        - attention_padding_mask (Optional[torch.BoolTensor], optional): Mask 적용 여부
+
+    Returns: output, attn
+        - **output** (batch, output_len, dimensions): attention 연산 결과
+        - **attn** (batch * num_attention_heads, v_len): attention matrix
+    """
+    def __init__(self, dim: int, num_attention_heads: int = 8) -> None:
         super(PackNUnpackAttention, self).__init__()
         self.pack_attention = MultiHeadAttention(dim, num_attention_heads)
         self.unpack_attention = MultiHeadAttention(dim, num_attention_heads)
