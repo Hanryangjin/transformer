@@ -1,10 +1,4 @@
-# Luna 사전학습 + 미세조정 템플릿 (Gradient Checkpointing + FP16 + DeepSpeed ZeRO)
-
-"""
-# $수정필. train과 evaluate 모두 하나의 클래스로 통합.
-# 하이퍼 파라미터를 동일한 곳에서 초기화 하고 기능적인 부분은 분리.
-# 각 함수의 내부 파라미터의 변동값에 주의.
-"""
+# Luna 사전학습 + 미세조정 (Gradient Checkpointing + FP16 + DeepSpeed ZeRO)
 
 import os, sys, csv
 import torch
@@ -19,12 +13,9 @@ drive_path = "/workspace"
 # Colab 환경에서는 drive_path로 이동이 필요 -> 아래의 클래스틀을 import 하기 위함
 #%cd "$drive_path"
 
-from transformer.luna.model import LunaTransformerEncoder, EditBasedLunaModel, LunaTransformer
+from transformer.luna.model import LunaTransformerEncoder, LunaTransformer
 from transformer.code_transformer.dataset import SpellingDataset
 from transformer.code_transformer.sentencepiece_tokenizer import SentencePieceTokenizer
-from transformer.code_transformer.WeightedCELossForGEC import WeightedCELossForGEC
-from transformer.code_transformer.EditBasedLoss import EditBasedLoss
-from transformer.code_transformer.EditBasedDecoder import EditBasedDecoder
 
 # ------------------------
 # 안전한 디코딩 함수
@@ -46,6 +37,9 @@ def safe_decode(tokenizer, ids):
 # ------------------------
 # 가장 최신에 저장된 체크포인트 path 반환
 # ------------------------
+"""
+    train, evaluate 함수에서 사용하는 양식을 그대로 함수로 옮겨서 정의
+"""
 def get_latest_checkpoint(checkpoint_dir):
     checkpoints = [f for f in os.listdir(checkpoint_dir) if f.endswith('.pt')]
     if not checkpoints:
@@ -58,6 +52,9 @@ def get_latest_checkpoint(checkpoint_dir):
 # ------------------------
 # 1. Luna 모델 정의
 # ------------------------
+"""
+    제거 또는 model.py로 이동
+"""
 class LunaModel(nn.Module):
     def __init__(self, vocab_size, d_model=512, num_layers=6, num_attention_heads=8):
         super().__init__()
@@ -83,6 +80,9 @@ class LunaModel(nn.Module):
 # ------------------------
 # 2. 학습 설정
 # ------------------------
+"""
+    주석 추가 필요
+"""
 def label_smoothed_loss(pred, target, epsilon=0.1, ignore_index=0, class_weight=None):
     """
     pred: (B*T, V)  - 로짓
@@ -116,6 +116,11 @@ def label_smoothed_loss(pred, target, epsilon=0.1, ignore_index=0, class_weight=
     loss = loss_per_tok[mask].mean()
     return loss
 
+"""
+    train, evaluate 함수는 하나로 두고, 파라미터를 통해 모델을 제어할 수 있도록 수정.
+        - train, evaluate에 파라미터 model_type 추가
+        - model_type에 대한 사전값은 __init__에서 딕셔너리 구조로 정의
+"""
 class pNup_s2s:
     def __init__(self):
         # 하이퍼파라미터 설정
@@ -145,7 +150,7 @@ class pNup_s2s:
         tokenizer = SentencePieceTokenizer(train_path, vocab_size=self.VOCAB_SIZE, max_length=self.MAX_SEQ_LENGTH).tokenizer
         dataset = SpellingDataset(train_path, val_path, tokenizer, self.MAX_SEQ_LENGTH)
         train_loader = DataLoader(dataset.train_dataset, batch_size=self.BATCH_SIZE, shuffle=True)
-        checkpoints = [f for f in os.listdir(f"{drive_path}/transformer/checkpoints") if f.endswith('.pt')]
+        checkpoints = [f for f in os.listdir(f"{transformer_path}/checkpoints") if f.endswith('.pt')]
         
         # 모델 객체 생성
         model = LunaTransformer(
@@ -174,7 +179,7 @@ class pNup_s2s:
             latest_checknum = 0
         else:
             # 가장 최근 체크포인트 로드
-            checkpoint_path = get_latest_checkpoint(f"{drive_path}/transformer/checkpoints")
+            checkpoint_path = get_latest_checkpoint(f"{transformer_path}/checkpoints")
             print(f"체크포인트 로드: {checkpoint_path}")
             checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
@@ -380,7 +385,7 @@ class pNup_s2s:
                     #'edit_ratio': avg_edit_ratio,
                     'tokenizer': tokenizer
                 }
-                torch.save(checkpoint, f"{drive_path}/transformer/checkpoints/luna_model_epoch_{epoch+1}.pt")
+                torch.save(checkpoint, f"{transformer_path}/checkpoints/luna_model_epoch_{epoch+1}.pt")
 
     # ------------------------
     # 3. 평가 설정
@@ -395,10 +400,10 @@ class pNup_s2s:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {device}")
 
-        CHECKPOINT_DIR   = f"{drive_path}/transformer/checkpoints"
-        transformer_path = f"{drive_path}/transformer"
+        transformer_path = f"/workspace/transformer"
         train_path = os.path.join(transformer_path, 'TrainData/combined_train_dataset.json')
         val_path   = os.path.join(transformer_path, 'ValidationData/combined_validation_dataset.json')
+        CHECKPOINT_DIR   = f"{transformer_path}/checkpoints"
         printed_guard = False
 
         # ===== 토크나이저/데이터셋 =====
@@ -678,4 +683,3 @@ if __name__ == '__main__':
     tne = pNup_s2s()
     tne.train()
     tne.evaluate()
-

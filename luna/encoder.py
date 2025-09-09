@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 
 from transformer.luna.attention import PackNUnpackAttention
-from transformer.luna.feed_forward import PositionwiseFeedForwardNetwork
 
 class PositionwiseFeedForwardNetwork(nn.Module):
     def __init__(self, d_model: int = 512, d_ff: int = 2048, dropout_p: float = 0.1) -> None:
