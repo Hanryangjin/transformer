@@ -176,6 +176,7 @@ class pNup_s2s:
     def train(self):
         # GPU 사용 가능 여부 확인
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
         print(f"Using device: {device}")
 
         # 데이터셋 및 데이터로더 설정
@@ -207,7 +208,7 @@ class pNup_s2s:
 
         # 손실 함수 및 옵티마이저 학습률 스케줄러 설정
         optimizer = torch.optim.AdamW(model.parameters(), lr=self.LEARNING_RATE, weight_decay=0.01)
-        scaler = GradScaler()  # FP16을 위한 Gradient Scaler
+        scaler = GradScaler(device_type)  # FP16을 위한 Gradient Scaler
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode='min', factor=0.5, patience=2
         )
@@ -308,7 +309,7 @@ class pNup_s2s:
                     mix_pred = next_pred[:, :-1]        # (B, T-2)
                     decoder_input[:, 1:] = torch.where(bern[:, :-1], mix_pred, di_tail)
 
-                with autocast():  # 자동 혼합 정밀도 (FP16)      
+                with autocast(device_type=device_type, dtype=torch.float16):  # 자동 혼합 정밀도 (FP16)      
                     outputs = model(input_ids, input_lengths, decoder_input)
 
                     # smoothed loss 정의 (1.5배)

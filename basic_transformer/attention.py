@@ -33,7 +33,9 @@ class MultiHeadAttention(nn.Module):
         print("scores", scores.shape, "mask", mask.shape)  # [디버그용]
         """
         if mask is not None:
-            scores = scores.masked_fill(mask == 0, -1e9)
+            mask = mask.to(torch.bool)
+            fill = torch.finfo(scores.dtype).min if scores.dtype != torch.float16 else -1e4
+            scores = scores.masked_fill(~mask, fill)
         
         attn = F.softmax(scores, dim=-1)
         attn = self.dropout(attn)
