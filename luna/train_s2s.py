@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 import numpy as np
 from tqdm import tqdm
 
@@ -116,6 +116,41 @@ def label_smoothed_loss(pred, target, epsilon=0.1, ignore_index=0, class_weight=
     loss = loss_per_tok[mask].mean()
     return loss
 
+# --- 정렬 기반 근사용 ---
+import difflib
+
+def _strip_special(ids, BOS, EOS, PAD):
+    if torch.is_tensor(ids):
+        ids = ids.tolist()
+    if ids and ids[0] == BOS:
+        ids = ids[1:]
+    if EOS in ids:
+        ids = ids[:ids.index(EOS)]
+    return [t for t in ids if t != PAD]
+
+def edit_counts_via_alignment(src_tokens, tgt_tokens, hyp_tokens):
+    """
+    src→tgt, src→hyp 변환에서 비-동일 구간을 편집으로 보고,
+    src 구간 겹침으로 TP를 근사적으로 셉니다. (빠른 모니터링용)
+    """
+    sm_gold = difflib.SequenceMatcher(a=src_tokens, b=tgt_tokens)
+    gold_spans = [op for op in sm_gold.get_opcodes() if op[0] != 'equal']
+
+    sm_pred = difflib.SequenceMatcher(a=src_tokens, b=hyp_tokens)
+    pred_spans = [op for op in sm_pred.get_opcodes() if op[0] != 'equal']
+
+    tp = 0
+    for tag, gi1, gi2, gj1, gj2 in gold_spans:
+        for tag2, pi1, pi2, pj1, pj2 in pred_spans:
+            # src 기준 구간이 겹치면 TP로 카운트
+            if not (pi2 <= gi1 or pi1 >= gi2):
+                tp += 1
+                break
+
+    fp = max(0, len(pred_spans) - tp)
+    fn = max(0, len(gold_spans) - tp)
+    return tp, fp, fn
+
 """
     train, evaluate 함수는 하나로 두고, 파라미터를 통해 모델을 제어할 수 있도록 수정.
         - train, evaluate에 파라미터 model_type 추가
@@ -125,7 +160,7 @@ class pNup_s2s:
     def __init__(self):
         # 하이퍼파라미터 설정
         self.BATCH_SIZE = 32
-        self.EPOCHS = 25
+        self.EPOCHS = 50
         self.LEARNING_RATE = 0.0001
         self.D_MODEL = 512
         self.NUM_HEADS = 8
@@ -144,12 +179,17 @@ class pNup_s2s:
         print(f"Using device: {device}")
 
         # 데이터셋 및 데이터로더 설정
+        """ 
+            해당 변수들은 학습/테스트 데이터의 변경이 있지 않는 한 모든 모델에서 공통적으로 사용될 것임. 
+                -> __init__에서 정의 또는 전역 변수로 정의
+        """
         transformer_path = "/workspace/transformer"
         train_path = os.path.join(transformer_path, 'TrainData/combined_train_dataset.json')
         val_path = os.path.join(transformer_path, 'ValidationData/combined_validation_dataset.json')
         tokenizer = SentencePieceTokenizer(train_path, vocab_size=self.VOCAB_SIZE, max_length=self.MAX_SEQ_LENGTH).tokenizer
         dataset = SpellingDataset(train_path, val_path, tokenizer, self.MAX_SEQ_LENGTH)
         train_loader = DataLoader(dataset.train_dataset, batch_size=self.BATCH_SIZE, shuffle=True)
+
         checkpoints = [f for f in os.listdir(f"{transformer_path}/checkpoints") if f.endswith('.pt')]
         
         # 모델 객체 생성
@@ -169,7 +209,7 @@ class pNup_s2s:
         optimizer = torch.optim.AdamW(model.parameters(), lr=self.LEARNING_RATE, weight_decay=0.01)
         scaler = GradScaler()  # FP16을 위한 Gradient Scaler
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=2, verbose=True
+            optimizer, mode='min', factor=0.5, patience=2
         )
 
         # 체크포인트 로드
@@ -191,22 +231,38 @@ class pNup_s2s:
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             model = model.to(device)
 
+        # 클래스 가중치 설정 (EOS 토큰에 1.5배 가중치 부여)
+        eos_weight = 1.5
+        class_weight = torch.ones(self.VOCAB_SIZE, device=device)
+        class_weight[self.EOS_TOKEN_ID] = eos_weight
+
         # 학습 루프
         model.train()
-        for epoch in range(latest_checknum, self.EPOCHS + latest_checknum):
-            total_loss = 0
-            total_edit_ratio = 0
-            
+        for epoch in range(latest_checknum, self.EPOCHS + latest_checknum):        
+            epoch_gold_edit_tok = 0
+            epoch_pred_edit_tok = 0
+            epoch_nonpad_tok    = 0
+
+            epoch_align_tp = 0
+            epoch_align_fp = 0
+            epoch_align_fn = 0
+            epoch_align_calls = 0
+
             total_gold_edits = 0
             total_pred_edits = 0
+
             correct_edit_total = 0
             correct_tokens = 0
             total_tokens = 0
+
+            total_loss_tok = 0
+            epoch_loss_tok = 0
+
+            LOG_ALIGN_EVERY = 500
             
             progress_bar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{self.EPOCHS+latest_checknum}')
 
             for batch_idx, batch in enumerate(progress_bar):
-                """ $수정 라인 =================================================================================== """
                 """
                     1. Beam Search 추가.
                     2. 길이 정규화 및 패널티 추가.
@@ -222,59 +278,44 @@ class pNup_s2s:
                         - 함수화 할 경우, 파라미터를 명확히 주석으로 표시
                 """
                 # 배치 데이터 추출
-                input_ids = batch['input_ids'].to(device)
-                output_ids = batch['output_ids'].to(device)
+                input_ids   = batch['input_ids'].to(device)
+                output_ids  = batch['output_ids'].to(device)
                 
                 # input_lengths 계산 (패딩 토큰 0을 제외한 실제 길이)
                 input_lengths = (input_ids != self.PAD_TOKEN_ID).sum(dim=1).to(device)
 
-                decoder_input = output_ids[:, :-1]  # Decoder 입력
-                target = output_ids[:, 1:]          # 정답
+                decoder_input   = output_ids[:, :-1]    # Decoder 입력
+                target          = output_ids[:, 1:]     # 정답
                 optimizer.zero_grad()
 
-                # 1) 1차 forward (teacher-forcing) - 예측을 얻기 위한 용도
-                logits_tf = model(input_ids, input_lengths, decoder_input)     # (B, T-1, V)
+                # ---- 1차 forward: teacher-forcing으로 예측 수집 ----
                 with torch.no_grad():
-                    next_pred = logits_tf.argmax(dim=-1)                       # (B, T-1)
+                    logits_tf = model(input_ids, input_lengths, decoder_input)  # (B, T-1, V)
+                    next_pred = logits_tf.argmax(dim=-1)                        # (B, T-1)
 
-                # 2) 스케줄드 샘플링 확률(에폭별로 점감)
-                #    예: 0ep=0.00 → 25ep=0.25까지 증가 (원하면 반대로도 가능)
-                max_ss = 0.25
-                ss_prob = min(max_ss, (epoch - latest_checknum + 1) / self.EPOCHS * max_ss)
+                # ---- 스케줄드 샘플링 확률: 에포크에 따라 점진 증가 ----
+                max_ss = 0.25  # 최댓값(0.1~0.25 권장)
+                # latest_checknum이 있는 코드 구조를 고려해 진행률 계산
+                ss_prob = min(max_ss, ((epoch - latest_checknum + 1) / self.EPOCHS) * max_ss)
 
-                # 3) 섞기: BOS 다음 시점부터 일부를 모델 예측으로 치환
+                # ---- 일부 토큰을 모델 예측으로 치환(오토리그레시브 일관성) ----
                 if ss_prob > 0.0:
-                    bern = torch.rand_like(next_pred.float(), device=device) < ss_prob  # (B, T-1)
-                    # decoder_input[:,1:] 위치에 next_pred[:,:-1]을 매칭시켜 주입
-                    #  - 현재 시점 토큰은 "직전 시점의 모델 출력"을 넣는 것이 맞음
-                    mix_pred = torch.zeros_like(decoder_input[:, 1:])
-                    mix_pred.copy_(next_pred[:, :-1])
-                    # 치환
-                    di_tail = decoder_input[:, 1:]
+                    # bern: (B, T-1)에서 True인 위치를 치환
+                    bern = (torch.rand_like(next_pred.float()) < ss_prob)
+                    # 현재 시점 토큰은 "직전 시점의 모델 출력"을 넣는 게 맞음
+                    # decoder_input[:, 1:]와 next_pred[:, :-1]를 정렬시켜 치환
+                    di_tail  = decoder_input[:, 1:]     # (B, T-2)
+                    mix_pred = next_pred[:, :-1]        # (B, T-2)
                     decoder_input[:, 1:] = torch.where(bern[:, :-1], mix_pred, di_tail)
 
-                ### 디버깅용 임시 변경 : autocast 제거
-                #with autocast():  # 자동 혼합 정밀도 (FP16)      
-                outputs = model(input_ids, input_lengths, decoder_input)
-                outputs = outputs.view(-1, outputs.size(-1))
-                target = target.contiguous().view(-1)
+                with autocast():  # 자동 혼합 정밀도 (FP16)      
+                    outputs = model(input_ids, input_lengths, decoder_input)
 
-                if not torch.isfinite(outputs).all():
-                    print("[Debug]배치별 target 비-패딩 토큰 수:", (target != self.PAD_TOKEN_ID).sum(dim=1).tolist())
-                    print("[Debug]Decoder outputs shape:", outputs.shape)
-                    print("[Debug]Target shape:", target.shape)
-                    print("[Debug🚨] outputs 텐서 내 NaN/Inf 존재!")
-                    print("예시 출력 (첫 5개):", outputs[0][:5])
-                    print("최대값:", outputs.max().item(), "최소값:", outputs.min().item(), "평균값:", outputs.mean().item())
-
-                eos_weight = 1.5
-                class_weight = torch.ones(self.VOCAB_SIZE, device=device)
-                class_weight[self.EOS_TOKEN_ID] = eos_weight
-
-                loss = label_smoothed_loss(outputs, target,
-                           epsilon=0.1,
-                           ignore_index=self.PAD_TOKEN_ID,
-                           class_weight=class_weight)
+                    # smoothed loss 정의 (1.5배)
+                    loss = label_smoothed_loss(outputs, target,
+                            epsilon=0.1,
+                            ignore_index=self.PAD_TOKEN_ID,
+                            class_weight=class_weight)
 
                 # Gradient Clipping
                 scaler.scale(loss).backward()
@@ -283,30 +324,56 @@ class pNup_s2s:
                 scaler.step(optimizer)
                 scaler.update()
 
-                # 수정 비율 계산
-                edit_ratio = ((output_ids != input_ids) & (output_ids != 0)).float().mean().item()
-                total_edit_ratio += edit_ratio
+                # --- 훈련 중 진단 로그 계산 ---
+                with torch.no_grad():
+                    # 1) 자리맞춤 기반 '편집 비율' 빠른 로그 (gold vs pred_tf)  ※ 배치 전체
+                    tf_pred = logits_tf.argmax(dim=-1)  # (B, T-1)
+                    # BOS + 예측으로 'pred_full' 구성 (출력 길이를 output_ids와 맞춤)
+                    pred_full = torch.cat([decoder_input[:, :1], tf_pred], dim=1)  # (B, T)
 
-                total_loss += loss.item()
-                if not torch.isfinite(loss):
-                    print(f"[Debug🚨] 비정상 Loss 발생: {loss.item()}")
-                    print("[Debug]현재 learning rate:", scheduler.optimizer.param_groups[0]['lr'])
-                
+                    # 자리맟줌 근사(BOS 제외)
+                    non_pad = (output_ids[:, 1:] != self.PAD_TOKEN_ID)
+                    gold_edits_mask = ((output_ids[:, 1:] != input_ids[:, 1:]) & non_pad)
+                    pred_edits_mask = ((pred_full[:, 1:]  != input_ids[:, 1:]) & non_pad)
+
+
+                    # 토큰 단위로 누적(에포크 전체 기준의 "비율" 계산에 쓰임)
+                    epoch_gold_edit_tok += gold_edits_mask.sum().item()
+                    epoch_pred_edit_tok += pred_edits_mask.sum().item()
+                    epoch_nonpad_tok    += non_pad.sum().item()
+
+                # 2) 정렬 기반 근사 P/R/F0.5
+                if (batch_idx % LOG_ALIGN_EVERY or batch_idx == 6697) == 0:
+                    with torch.no_grad():
+                        S = min(8, input_ids.size(0))
+                        tp = fp = fn = 0
+                        for b in range(S):
+                            src_seq = _strip_special(input_ids[b],  self.BOS_TOKEN_ID, self.EOS_TOKEN_ID, self.PAD_TOKEN_ID)
+                            tgt_seq = _strip_special(output_ids[b], self.BOS_TOKEN_ID, self.EOS_TOKEN_ID, self.PAD_TOKEN_ID)
+                            hyp_seq = _strip_special(pred_full[b],  self.BOS_TOKEN_ID, self.EOS_TOKEN_ID, self.PAD_TOKEN_ID)
+                            tpi, fpi, fni = edit_counts_via_alignment(src_seq, tgt_seq, hyp_seq)
+                            tp += tpi; fp += fpi; fn += fni
+                        epoch_align_tp += tp
+                        epoch_align_fp += fp
+                        epoch_align_fn += fn
+                        epoch_align_calls += 1
+
                 # 예측
                 pred_ids = outputs.argmax(dim=-1)
                 pred_ids = pred_ids.view(output_ids.size(0), output_ids.size(1) - 1)
 
-                # 수정 비율
-                edit_ratio = ((output_ids != input_ids) & (output_ids != self.PAD_TOKEN_ID)).float().mean().item()
-                total_edit_ratio += edit_ratio
-
                 # 정확도 계산
                 target_2d = target.view(pred_ids.size(0), pred_ids.size(1))
+                nonpad_loss = (target_2d != self.PAD_TOKEN_ID).sum().item()
 
+                # 토큰 가중 손실 누적
+                total_loss_tok += loss.item() * nonpad_loss
+                epoch_loss_tok += nonpad_loss
+                
                 correct_tokens += ((pred_ids == target_2d) & (target_2d != self.PAD_TOKEN_ID)).sum().item()
                 total_tokens += (target_2d != self.PAD_TOKEN_ID).sum().item()
 
-                # 편집 정확도
+                # 편집 정확도(자리맞춤 방식)
                 gold_edits = ((output_ids[:, 1:] != input_ids[:, 1:]) & (output_ids[:, 1:] != self.PAD_TOKEN_ID))
                 pred_edits = ((pred_ids != input_ids[:, 1:]) & (pred_ids != self.PAD_TOKEN_ID))
                 correct_edits = ((pred_ids == output_ids[:, 1:]) & gold_edits)
@@ -314,13 +381,33 @@ class pNup_s2s:
                 total_gold_edits += gold_edits.sum().item()
                 total_pred_edits += pred_edits.sum().item()
                 correct_edit_total += correct_edits.sum().item()
-                
+                # --------------------
+
+                # 진행률 표시줄 업데이트
                 progress_bar.set_postfix({
                     'loss': f'{loss.item():.4f}',
                     #'edit_ratio': f'{edit_ratio:.2f}'
                 })
 
-                """ $수정 라인 =================================================================================== """
+                # ---- 디버깅용 출력문 ----
+                batch_nonpad = (target_2d != self.PAD_TOKEN_ID).sum().item()
+                outputs_view = outputs.view(-1, outputs.size(-1))
+                target_view = target.contiguous().view(-1)
+
+                # 비정상적인 outputs 텐서 체크
+                if not torch.isfinite(outputs_view).all():
+                    print("[Debug]배치별 target 비-패딩 토큰 수:", batch_nonpad)
+                    print("[Debug]Decoder outputs shape:", outputs_view.shape)
+                    print("[Debug]Target shape:", target_view.shape)
+                    print("[Debug🚨] outputs 텐서 내 NaN/Inf 존재!")
+                    print("예시 출력 (첫 5개):", outputs_view[0][:5])
+                    print("최대값:", outputs_view.max().item(), "최소값:", outputs_view.min().item(), "평균값:", outputs_view.mean().item())
+                
+                # 비정상적인 loss 값 체크
+                if not torch.isfinite(loss):
+                    print(f"[Debug🚨] 비정상 Loss 발생: {loss.item()}")
+                    print("[Debug]현재 learning rate:", scheduler.get_last_lr())
+                # --------------------
                 
                 # 샘플 출력 (각 에포크마다 5개)
                 if batch_idx < 5:
@@ -331,7 +418,7 @@ class pNup_s2s:
                         pred_text = safe_decode(tokenizer, pred_ids_with_pad)
 
                         # 샘플 출력
-                        print(f"\t샘플 {batch_idx+1}:")
+                        print(f"\n\t샘플 {batch_idx+1}:")
                         print(f"\t> 입력: {input_text}")
                         print(f"\t> 예측: {pred_text}")
                         print(f"\t> 정답: {output_text}")
@@ -339,29 +426,46 @@ class pNup_s2s:
                     except Exception as e:
                         print(f"[Error🚨] 샘플 출력 중 오류 발생: {e}")
             
-            # 에포크별 평균 손실 및 지표 계산
-            avg_loss = total_loss / len(train_loader)
-            avg_edit_ratio = total_edit_ratio / len(train_loader)
-            
+            # ----- 에포크별 평균 손실 및 지표 계산 -----
+            # 손실/토큰 정확도
+            avg_loss = total_loss_tok / max(1, epoch_loss_tok)
+            avg_edit_ratio = (epoch_pred_edit_tok / epoch_nonpad_tok) if epoch_nonpad_tok > 0 else 0.0
             token_acc = correct_tokens / total_tokens if total_tokens > 0 else 0.0
 
+            # 자리 맞춤 기반 P/R/F0.5
             precision = correct_edit_total / total_pred_edits if total_pred_edits > 0 else 0.0
-            recall = correct_edit_total / total_gold_edits if total_gold_edits > 0 else 0.0
+            recall    = correct_edit_total / total_gold_edits if total_gold_edits > 0 else 0.0
             beta = 0.5
-            if precision + recall > 0:
-                f0_5 = (1 + beta**2) * precision * recall / (beta**2 * precision + recall)
-            else:
-                f0_5 = 0.0
+            f0_5 = (1 + beta**2) * precision * recall / (beta**2 * precision + recall) if (precision + recall) > 0 else 0.0
 
-            print(f"Epoch {epoch+1}, Avg Loss: {avg_loss:.4f}, Avg Edit Ratio: {avg_edit_ratio:.4f}")
-            print(f"   Token Acc: {token_acc:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F0.5: {f0_5:.4f}")
-            #print(f"Epoch {epoch+1}, Average Loss: {avg_loss:.4f}, Average Edit Ratio: {avg_edit_ratio:.4f}")
-            
-            # 에포크별 지표 수치 기록
-            with open(f"{transformer_path}/epoch_metrics.csv", mode="a", newline="") as file:
+            # 에포크 전체 기준 자리맞춤 편집 비율 (토큰 가중 평균)
+            epoch_gold_edit_ratio = (epoch_gold_edit_tok / epoch_nonpad_tok) if epoch_nonpad_tok > 0 else 0.0
+            epoch_pred_edit_ratio = (epoch_pred_edit_tok / epoch_nonpad_tok) if epoch_nonpad_tok > 0 else 0.0
+
+            # 정렬 기반 근사 P/R/F0.5
+            if (epoch_align_tp + epoch_align_fp + epoch_align_fn) > 0:
+                align_prec = epoch_align_tp / (epoch_align_tp + epoch_align_fp) if (epoch_align_tp + epoch_align_fp) > 0 else 0.0
+                align_reca = epoch_align_tp / (epoch_align_tp + epoch_align_fn) if (epoch_align_tp + epoch_align_fn) > 0 else 0.0
+                align_f05  = (1 + beta**2) * align_prec * align_reca / (beta**2 * align_prec + align_reca) if (align_prec + align_reca) > 0 else 0.0
+            else:
+                align_prec = align_reca = align_f05 = float('nan')
+
+            print(f"Epoch {epoch+1}, Avg Loss: {avg_loss:.4f}, Avg Edit Ratio(pred/token-wt): {avg_edit_ratio:.4f}")
+            print(f"    Token Acc(2nd pass): {token_acc:.4f}, (pos-based) Precision: {precision:.4f}, Recall: {recall:.4f}, F0.5: {f0_5:.4f}")
+            print(f"    gold_edit_ratio={epoch_gold_edit_ratio:.3f} | pred_edit_ratio={epoch_pred_edit_ratio:.3f} | ratio={epoch_pred_edit_ratio/epoch_gold_edit_ratio if epoch_gold_edit_ratio>0 else 0:.3f}")
+            print(f"    Align(P/R/F0.5)={align_prec:.3f}/{align_reca:.3f}/{align_f05:.3f} (calls={epoch_align_calls})")
+
+            # CSV 기록
+            csv_path = f"{transformer_path}/epoch_metrics.csv"
+            write_header = (epoch == 0) and (not os.path.exists(csv_path))
+            with open(csv_path, mode="a", newline="") as file:
                 writer = csv.writer(file)
-                if epoch == 0:
-                    writer.writerow(["epoch", "loss", "edit_ratio", "token_acc", "precision", "recall", "f0.5"])
+                if write_header:
+                    writer.writerow([
+                        "epoch", "loss", "edit_ratio", "token_acc", "precision", "recall", "f0.5",
+                        "gold_edit_ratio_token_wt", "pred_edit_ratio_token_wt",
+                        "align_prec", "align_reca", "align_f0.5", "align_calls"
+                    ])
                 writer.writerow([
                     epoch + 1,
                     avg_loss,
@@ -369,8 +473,15 @@ class pNup_s2s:
                     token_acc,
                     precision,
                     recall,
-                    f0_5
+                    f0_5,
+                    epoch_gold_edit_ratio,
+                    epoch_pred_edit_ratio,
+                    align_prec,
+                    align_reca,
+                    align_f05,
+                    epoch_align_calls
                 ])
+            # --------------------
 
             # 학습률 조정
             scheduler.step(avg_loss)
