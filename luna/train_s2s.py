@@ -502,42 +502,60 @@ class pNup_s2s:
     # ------------------------
     # 3. 평가 설정
     # ------------------------
-    def evaluate(self):
-        import os, torch
-        from torch.utils.data import DataLoader
+    def evaluate(self,
+        beam_size: int = 4,
+        max_gen_len: int = 127,         # 디코더 토큰 수(BOS 제외) 상한 (MAX_LENGTH-1 권장)
+        length_alpha: float = 0.6,      # 길이 패널티 alpha (0.6~1.0 튜닝)
+        repetition_penalty: float = 1.1,# 1.0이면 비활성
+        no_repeat_ngram_size: int = 3,  # 0이면 비활성(권장: 2~4)
+        diag_tf: bool = False,          # True면 TF-loss/TF-acc도 병행 계산(느려짐)
+        dump_for_errant: bool = True,   # ERRANT 입력 덤프 저장
+        dump_dir_name: str = "eval_dumps"
+    ):
+        """
+        1) BeamSearch(+length penalty, repetition penalty, no-repeat n-gram)로 프리러닝 생성
+        2) 정렬 기반 편집지표(근사)로 Precision/Recall/F0.5 계산
+        3) (옵션) TF-loss/TF-Acc 진단
+        4) (옵션) ERRANT 덤프(src/hyp/ref) 저장
+        5) 샘플 5개: 입력/예측/정답 형식 출력 (train과 동일 스타일)
+        """
+        import os, math, difflib, csv
         from tqdm import tqdm
+        import torch
         import torch.nn.functional as F
+        from torch.utils.data import DataLoader
 
-        # ===== 기본 설정 =====
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Using device: {device}")
 
-        transformer_path = f"/workspace/transformer"
+        # ----- 환경/경로(기존 train 설정과 일치) -----
+        CHECKPOINT_DIR   = f"{drive_path}/transformer/checkpoints"
+        transformer_path = f"{drive_path}/transformer"
+
+        # ----- 데이터/토크나이저/로더 -----
         train_path = os.path.join(transformer_path, 'TrainData/combined_train_dataset.json')
         val_path   = os.path.join(transformer_path, 'ValidationData/combined_validation_dataset.json')
-        CHECKPOINT_DIR   = f"{transformer_path}/checkpoints"
-        printed_guard = False
 
-        # ===== 토크나이저/데이터셋 =====
-        tokenizer = SentencePieceTokenizer(val_path, vocab_size=self.VOCAB_SIZE, max_length=self.MAX_SEQ_LENGTH).tokenizer
-        dataset = SpellingDataset(train_path, val_path, tokenizer, self.MAX_SEQ_LENGTH)
+        tokenizer = SentencePieceTokenizer(train_path, vocab_size=self.VOCAB_SIZE, max_length=self.MAX_SEQ_LENGTH).tokenizer
+        dataset   = SpellingDataset(train_path, val_path, tokenizer, self.MAX_SEQ_LENGTH)
         val_loader = DataLoader(dataset.val_dataset, batch_size=self.BATCH_SIZE, shuffle=False)
 
-        # ===== 모델/criterion =====
+        # ----- 모델 -----
         model = LunaTransformer(
             vocab_size=self.VOCAB_SIZE,
-            d_model=self.D_MODEL,
-            num_layers=self.NUM_LAYERS,
-            num_attention_heads=self.NUM_HEADS,
-            d_ff=self.D_FF,
-            dropout_p=self.DROPOUT,
+            d_model=512,
+            num_layers=6,
+            num_attention_heads=8,
+            d_ff=2048,
+            dropout_p=0.1,
             project_embedding_length=32,
             max_length=self.MAX_SEQ_LENGTH
         ).to(device)
 
+        # (옵션) TF 진단에서만 사용
         criterion = torch.nn.CrossEntropyLoss(ignore_index=self.PAD_TOKEN_ID)
 
-        # ===== 체크포인트 로드 =====
+        # ----- 체크포인트 로드 -----
         ckpt_path = get_latest_checkpoint(CHECKPOINT_DIR)
         if ckpt_path is None:
             print(">> 체크포인트를 찾을 수 없습니다:", CHECKPOINT_DIR)
@@ -545,251 +563,271 @@ class pNup_s2s:
         checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model_state_dict'])
         latest_checkpoint = os.path.basename(ckpt_path)
-        epoch_num = int(latest_checkpoint.split('_')[-1].split('.')[0])
+        try:
+            epoch_num = int(latest_checkpoint.split('_')[-1].split('.')[0])
+        except:
+            epoch_num = -1
         print(f">> 체크포인트 로드: {ckpt_path} (epoch {epoch_num})")
 
-        # ==== [추가] free-running 생성 함수 ====
+        # ===================== 헬퍼들 =====================
+
+        def _strip_special(ids, BOS, EOS, PAD):
+            if torch.is_tensor(ids): ids = ids.tolist()
+            if ids and ids[0] == BOS: ids = ids[1:]
+            if EOS in ids:
+                ids = ids[:ids.index(EOS)]
+            return [t for t in ids if t != PAD]
+
+        def _first_token_text(ids):
+            """첫 비-특수토큰을 텍스트로 (샘플 출력용)"""
+            seq = ids.tolist() if torch.is_tensor(ids) else list(ids)
+            first = ""
+            for t in seq:
+                if t in (self.BOS_TOKEN_ID, self.EOS_TOKEN_ID, self.PAD_TOKEN_ID): continue
+                try:
+                    first = safe_decode(tokenizer, [t])
+                except:
+                    first = ""
+                break
+            return first
+
+        def _length_penalty(length, alpha=length_alpha):
+            # GNMT length penalty
+            return ((5 + length) ** alpha) / ((5 + 1) ** alpha)
+
+        def _apply_repetition_penalty(logits_row, generated, penalty):
+            # CTRL 방식: 이미 생성된 토큰의 logit을 조정
+            if penalty == 1.0 or len(generated) == 0:
+                return logits_row
+            unique_tokens = set(generated)
+            # in-place 전환 전 clone
+            logits_row = logits_row.clone()
+            with torch.no_grad():
+                for t in unique_tokens:
+                    if t < 0 or t >= logits_row.numel():  # 안전장치
+                        continue
+                    val = logits_row[t]
+                    logits_row[t] = val / penalty if val > 0 else val * penalty
+            return logits_row
+
+        def _banned_tokens_for_ngram(seq, n):
+            # no-repeat n-gram: 마지막 n-1 토큰 prefix와 과거 next-token들을 금지
+            if n <= 0 or len(seq) < n - 1:
+                return set()
+            banned = set()
+            prefix = tuple(seq[-(n - 1):]) if n - 1 > 0 else tuple()
+            # build n-gram dict
+            hist = {}
+            for i in range(len(seq) - n + 1):
+                gram = tuple(seq[i:i + n])
+                pfx = gram[:-1]
+                nxt = gram[-1]
+                hist.setdefault(pfx, set()).add(nxt)
+            if prefix in hist:
+                banned = hist[prefix]
+            return banned
+
         @torch.no_grad()
-        def free_run_generate(model, input_ids, input_lengths,
-                            max_len, bos_id, eos_id, pad_id):
+        def beam_search_generate(src_ids_b, src_len_b):
             """
-            입력 배치에 대해 오토리그레시브로 디코딩(teacher-forcing 없음).
-            반환: pred_full (B, T_full) : [BOS] ... EOS ... PAD
+            src_ids_b : (Tsrc,) Long
+            src_len_b : () Long
+            return: List[int] (BOS ... EOS)
             """
-            B = input_ids.size(0)
-            # 시작: [BOS] + PAD...  형태로 초기화
-            dec = torch.full((B, 1), bos_id, dtype=input_ids.dtype, device=input_ids.device)
+            beams = [ (0.0, [self.BOS_TOKEN_ID]) ]  # (cum_logprob, seq)
 
-            # 이미 EOS를 낸 샘플 마스크
-            finished = torch.zeros(B, dtype=torch.bool, device=input_ids.device)
+            for step in range(max_gen_len):
+                new_beams = []
+                all_ended = True
+                for score, seq in beams:
+                    if seq[-1] == self.EOS_TOKEN_ID:
+                        new_beams.append((score, seq))
+                        continue
+                    all_ended = False
 
-            # 디코딩 제약 하이퍼파라미터
-            repetition_penalty = 1.12     # 1.1~1.2 추천
-            eos_bonus = 0.25              # 0.2~0.5 사이 실험
-            no_repeat_ngram = 3           # 2나 3 추천
-            max_same_token = 8            # 동일 토큰 N회 연속 방지
+                    # 디코더 입력 구성
+                    dec_inp = torch.tensor(seq, dtype=torch.long, device=device).unsqueeze(0)  # (1, t)
+                    # 모델 forward (간단구현: 전체 길이 재실행)
+                    logits = model(
+                        src_ids_b.unsqueeze(0),         # (1, Tsrc)
+                        src_len_b.unsqueeze(0),         # (1,)
+                        dec_inp                         # (1, t)
+                    )                                   # (1, t, V)
+                    next_logits = logits[:, -1, :].squeeze(0)  # (V,)
 
-            # 최대 길이-1 만큼 반복 (BOS 포함하므로 -1)
-            for t in range(1, max_len):
-                logits = model(input_ids, input_lengths, dec)      # (B, t, V)
-                step_logits = logits[:, -1, :].clone()             # (B, V)
+                    # 반복 패널티
+                    next_logits = _apply_repetition_penalty(next_logits, seq, repetition_penalty)
 
-                # --- (1) repetition penalty ---
-                # 지금까지 쓴 토큰(out=dec)의 빈도를 이용해 사용한 토큰의 로짓을 조금 낮춤
-                for b in range(B):
-                    used = dec[b].unique()
-                    step_logits[b, used] /= repetition_penalty
+                    # no-repeat n-gram 금지 토큰 -inf 처리
+                    banned = _banned_tokens_for_ngram(seq, no_repeat_ngram_size)
+                    if banned:
+                        next_logits[list(banned)] = float('-inf')
 
-                # --- (2) no-repeat n-gram (아주 간단 버전) ---
-                # prefix가 동일한 n-gram 반복을 억제: 직전 토큰 시퀀스가 충분히 길면 일부 상위 후보를 -inf 처리
-                if no_repeat_ngram >= 2 and dec.size(1) >= (no_repeat_ngram - 1):
-                    prefix = dec[:, -(no_repeat_ngram - 1):]    # (B, n-1)
-                    # 간단 버전: 각 배치마다 상위 K 후보를 막아 보수적으로 반복 억제
-                    K = 5
-                    topk = step_logits.topk(K, dim=-1).indices  # (B, K)
-                    # prefix가 짧을 땐 실제 n-gram 인덱싱을 하지 않고 보수적으로 topK를 낮춤
-                    step_logits.scatter_(1, topk, -1e9)
+                    # 패딩은 생성 금지
+                    next_logits[self.PAD_TOKEN_ID] = float('-inf')
 
-                # --- (3) EOS 보너스 ---
-                step_logits[:, eos_id] += eos_bonus
+                    logprobs = F.log_softmax(next_logits, dim=-1)  # (V,)
+                    topk_logprobs, topk_ids = torch.topk(logprobs, beam_size)
 
-                # --- (4) 동일 토큰 연속 방지 ---
-                if dec.size(1) >= max_same_token:
-                    last_tok = dec[:, -1]                      # (B,)
-                    run = (dec[:, -(max_same_token-1):] == last_tok.unsqueeze(1)).all(dim=1)  # True면 직전 N-1이 전부 같음
-                    # 연속 run인 배치에 대해 해당 토큰을 강제로 배제
-                    step_logits[run, last_tok] = -1e9
+                    for lp, idx in zip(topk_logprobs.tolist(), topk_ids.tolist()):
+                        new_seq = seq + [idx]
+                        new_score = score + lp  # raw logprob 누적
+                        new_beams.append((new_score, new_seq))
 
-                next_ids = step_logits.argmax(dim=-1)          # (B,)
-                next_ids = torch.where(finished, torch.full_like(next_ids, pad_id), next_ids)
-                finished |= (next_ids == eos_id)
-
-                dec = torch.cat([dec, next_ids.unsqueeze(1)], dim=1)
-                if finished.all():
+                if all_ended:
                     break
 
-            # 길이 모자라면 PAD로 우측 패딩
-            if dec.size(1) < max_len:
-                pad_cols = max_len - dec.size(1)
-                pad = torch.full((B, pad_cols), pad_id, dtype=dec.dtype, device=dec.device)
-                dec = torch.cat([dec, pad], dim=1)
+                # 빔 정렬 및 상위 K 유지
+                new_beams.sort(key=lambda x: x[0], reverse=True)
+                beams = new_beams[:beam_size]
 
-            return dec  # (B, max_len)
+            # 완결 빔 선택(길이 패널티 반영)
+            def finalized_score(b):
+                sc, seq = b
+                eff_len = len(seq) if self.EOS_TOKEN_ID not in seq else (seq.index(self.EOS_TOKEN_ID) + 1)
+                return sc / _length_penalty(eff_len, length_alpha)
 
-        # ===== 평가 루프 =====
+            best = max(beams, key=finalized_score)
+            return best[1]
+
+        # ===================== 평가 루프 =====================
+
         model.eval()
-        total_loss = 0.0
-        total_tokens = 0
-        total_eval_non_pad = 0
-        correct_tokens = 0
 
-        total_gold_edits = 0
-        total_pred_edits = 0
-        correct_edits = 0
+        total_tp = total_fp = total_fn = 0
+        num_samples = 0
 
-        first_batch_guard_printed = False
+        # (옵션) TF-loss/acc 진단
+        tf_total_loss = 0.0
+        tf_total_tok  = 0
+        tf_correct_tok = 0
 
-        # 샘플 출력 개수 컨트롤 (원하면 3으로 바꿔도 됨)
-        N_SAMPLES = 5
-        printed_examples = 0
+        # (옵션) ERRANT 덤프 준비
+        dump_src, dump_hyp, dump_ref = [], [], []
 
-        # 디코딩용 함수: PAD 제거 + BOS/EOS 잘라내기
-        def _strip_special(ids, bos_id=self.BOS_TOKEN_ID, eos_id=self.EOS_TOKEN_ID, pad_id=self.PAD_TOKEN_ID):
-            # 리스트/텐서 모두 지원
-            if torch.is_tensor(ids):
-                ids = ids.tolist()
-            # 앞쪽 BOS 제거
-            if ids and ids[0] == bos_id:
-                ids = ids[1:]
-            # EOS 이후 잘라내기
-            if eos_id in ids:
-                cut = ids.index(eos_id)
-                ids = ids[:cut]
-            # PAD 제거
-            ids = [t for t in ids if t != pad_id]
-            return ids
+        # 샘플 출력(입력/예측/정답) 5개만
+        printed_samples = 0
+        MAX_PRINT = 5
 
-        with torch.no_grad():
-            for batch in tqdm(val_loader, desc="Validation"):
-                input_ids  = batch['input_ids'].to(device)     # (B, T_full)
-                output_ids = batch['output_ids'].to(device)    # (B, T_full) = [BOS ... EOS PAD...]
+        pbar = tqdm(val_loader, desc=f"Validation (beam={beam_size}, α={length_alpha}, rep={repetition_penalty}, ngr={no_repeat_ngram_size})")
+        for batch in pbar:
+            input_ids  = batch['input_ids'].to(device)   # (B, T)
+            output_ids = batch['output_ids'].to(device)  # (B, T)
+            input_lengths = (input_ids != self.PAD_TOKEN_ID).sum(dim=1)  # (B,)
 
-                input_lengths = (input_ids != self.PAD_TOKEN_ID).sum(dim=1)
+            B = input_ids.size(0)
+            # 1) 프리러닝 생성 (beam search) — 샘플 단위
+            preds = []
+            for b in range(B):
+                hyp_ids = beam_search_generate(input_ids[b], input_lengths[b])
+                preds.append(hyp_ids)
 
-                # ---- teacher-forcing 기반 loss만 계산 (진단용) ----
-                decoder_input = output_ids[:, :-1].contiguous()
-                target        = output_ids[:,  1:].contiguous()   # (B, T-1)
+            # 2) 정렬 기반 편집지표(근사) — 마이크로 평균
+            for b in range(B):
+                src_seq = _strip_special(input_ids[b],  self.BOS_TOKEN_ID, self.EOS_TOKEN_ID, self.PAD_TOKEN_ID)
+                ref_seq = _strip_special(output_ids[b], self.BOS_TOKEN_ID, self.EOS_TOKEN_ID, self.PAD_TOKEN_ID)
+                hyp_seq = _strip_special(torch.tensor(preds[b], device=device), self.BOS_TOKEN_ID, self.EOS_TOKEN_ID, self.PAD_TOKEN_ID)
 
-                logits = model(input_ids, input_lengths, decoder_input)  # (B, T-1, V)
+                sm_gold = difflib.SequenceMatcher(a=src_seq, b=ref_seq)
+                gold_spans = [op for op in sm_gold.get_opcodes() if op[0] != 'equal']
 
-                if not first_batch_guard_printed:
-                    # 정렬/shape 가드
-                    eos_pos = (output_ids[0] != self.PAD_TOKEN_ID).sum() - 1
-                    print("[VAL] BOS/EOS (should be 2,3):", output_ids[0,0].item(), output_ids[0, eos_pos].item())
-                    print("[VAL] shapes (logits vs target):", logits.shape, target.shape)
-                    print("[VAL] non-pad ratio in target:", (target != self.PAD_TOKEN_ID).float().mean().item())
-                    print("[VAL] sample target head:", target[0, :10].tolist())
-                    print("[VAL] sample pred head  :", logits.argmax(-1)[0, :10].tolist())
-                    print("[VAL] sample decoder_inp:", decoder_input[0, :10].tolist())
-                    first_batch_guard_printed = True
+                sm_pred = difflib.SequenceMatcher(a=src_seq, b=hyp_seq)
+                pred_spans = [op for op in sm_pred.get_opcodes() if op[0] != 'equal']
 
-                loss = criterion(logits.view(-1, self.VOCAB_SIZE), target.view(-1))
-                non_pad_mask = (target != self.PAD_TOKEN_ID)
-                num_non_pad = non_pad_mask.sum().item()
-                total_loss += loss.item() * num_non_pad
-                total_tokens += num_non_pad
-
-                # ---- (E’) free-running 생성으로 예측/지표 계산 ----
-                pred_full = free_run_generate(
-                    model=model,
-                    input_ids=input_ids,
-                    input_lengths=input_lengths,
-                    max_len=output_ids.size(1),   # 정답 길이에 맞춰 생성
-                    bos_id=self.BOS_TOKEN_ID,
-                    eos_id=self.EOS_TOKEN_ID,
-                    pad_id=self.PAD_TOKEN_ID
-                )  # (B, T_full)
-
-                # 토큰 정확도는 free-running 예측 기준으로(실사용과 일치)
-                non_pad_full = (output_ids != self.PAD_TOKEN_ID)
-                correct_tokens += ((pred_full == output_ids) & non_pad_full).sum().item()
-
-                total_eval_non_pad += non_pad_full.sum().item()
-
-                # 편집 지표(입력/정답/예측을 같은 프레임에서 비교)
-                valid_mask = (output_ids != self.PAD_TOKEN_ID) & (output_ids != self.BOS_TOKEN_ID) & (output_ids != self.EOS_TOKEN_ID)
-                gold_edits = (output_ids != input_ids) & valid_mask
-                pred_edits = (pred_full  != input_ids) & valid_mask
-
-                correct_edits   += ((pred_full == output_ids) & gold_edits).sum().item()
-                total_gold_edits += gold_edits.sum().item()
-                total_pred_edits += pred_edits.sum().item()
-
-                # 배치에서 몇 개 뽑아 "입력/예측/정답 + 첫 토큰 비교" 출력
-                if printed_examples < N_SAMPLES:
-                    bsz = input_ids.size(0)
-                    # 가능한 만큼만 출력
-                    take = min(N_SAMPLES - printed_examples, bsz)
-                    for i in range(take):
-                        # 첫 토큰 비교(예측은 pred_full[:,1], 정답은 output_ids[:,1])
-                        try:
-                            pred_first_id = pred_full[i, 1].item()
-                            gold_first_id = output_ids[i, 1].item()
-                            pred_first = safe_decode(tokenizer, [pred_first_id])
-                            gold_first = safe_decode(tokenizer, [gold_first_id])
-                            print(f"> 첫 토큰 비교 | 예측: {pred_first} / 정답: {gold_first}")
-                        except Exception as e:
-                            print(f"> 첫 토큰 비교 중 오류: {e}")
-
-                        # 본문 디코딩(특수토큰/패딩 제거)
-                        in_ids   = _strip_special(input_ids[i])
-                        pr_ids   = _strip_special(pred_full[i])
-                        out_ids  = _strip_special(output_ids[i])
-
-                        input_text  = safe_decode(tokenizer, in_ids)
-                        pred_text   = safe_decode(tokenizer, pr_ids)
-                        output_text = safe_decode(tokenizer, out_ids)
-
-                        print(f"\n\t샘플 {printed_examples + 1}:")
-                        print(f"\t> 입력: {input_text}")
-                        print(f"\t> 예측: {pred_text}")
-                        print(f"\t> 정답: {output_text}")
-
-                        printed_examples += 1
-                        if printed_examples >= N_SAMPLES:
+                # src 기준 span overlap으로 TP 근사
+                tp = 0
+                for tag, gi1, gi2, gj1, gj2 in gold_spans:
+                    for tag2, pi1, pi2, pj1, pj2 in pred_spans:
+                        if not (pi2 <= gi1 or pi1 >= gi2):  # overlap on src
+                            tp += 1
                             break
+                fp = max(0, len(pred_spans) - tp)
+                fn = max(0, len(gold_spans) - tp)
 
-                if not printed_guard:
-                    eos_rate = (pred_full[:, 1:] == self.EOS_TOKEN_ID).float().mean().item()
-                    print("[VAL] EOS rate(after first token):", eos_rate)
+                total_tp += tp
+                total_fp += fp
+                total_fn += fn
 
-                    # 입력 무시 여부를 간단히 체크(샘플 몇 개만 섞어서)
-                    idx = torch.arange(input_ids.size(0), device=input_ids.device)
-                    idx = idx[torch.randperm(idx.numel())[: min(8, idx.numel())]]
-                    pred_shuf = free_run_generate(
-                        model, input_ids[idx], (input_ids[idx] != self.PAD_TOKEN_ID).sum(1),
-                        max_len=output_ids.size(1),
-                        bos_id=self.BOS_TOKEN_ID, eos_id=self.EOS_TOKEN_ID, pad_id=self.PAD_TOKEN_ID
-                    )
-                    # EOS rate가 0에 가깝다면 EOS가 거의 안 나옴 → 디코딩 무한반복 경향
-                    same_ratio = (pred_full[idx] == pred_shuf).float().mean().item()
-                    print("[VAL] Input-agnostic ratio:", same_ratio)
+                # 3) ERRANT 덤프 텍스트 저장
+                if dump_for_errant:
+                    src_txt = safe_decode(tokenizer, [self.BOS_TOKEN_ID] + src_seq + [self.EOS_TOKEN_ID])
+                    ref_txt = safe_decode(tokenizer, [self.BOS_TOKEN_ID] + ref_seq + [self.EOS_TOKEN_ID])
+                    hyp_txt = safe_decode(tokenizer, preds[b])
 
-                    def _strip(ids, BOS, EOS, PAD):
-                        if torch.is_tensor(ids): ids = ids.tolist()
-                        if ids and ids[0] == BOS: ids = ids[1:]
-                        if EOS in ids:
-                            ids = ids[:ids.index(EOS)]
-                        return [t for t in ids if t != PAD]
+                    dump_src.append(src_txt)
+                    dump_ref.append(ref_txt)
+                    dump_hyp.append(hyp_txt)
 
-                    # 배치에서 4개만 샘플 비교
-                    k = min(4, pred_full.size(0))
-                    same = 0
-                    for j in range(k):
-                        a = _strip(pred_full[j], self.BOS_TOKEN_ID, self.EOS_TOKEN_ID, self.PAD_TOKEN_ID)
-                        b = _strip(pred_shuf[j], self.BOS_TOKEN_ID, self.EOS_TOKEN_ID, self.PAD_TOKEN_ID)
-                        same += 1.0 if a == b else 0.0
-                    print("[VAL] Input-agnostic (stripped) mean:", same / k)
+                # 4) 샘플 출력(최대 5개, train과 동일 스타일)
+                if printed_samples < MAX_PRINT:
+                    input_text  = safe_decode(tokenizer, input_ids[b].detach().cpu().tolist())
+                    pred_text   = safe_decode(tokenizer, preds[b])
+                    output_text = safe_decode(tokenizer, output_ids[b].detach().cpu().tolist())
 
-                    printed_guard = True
+                    # 첫 토큰 비교(비-특수)
+                    pred_first  = _first_token_text(preds[b])
+                    gold_first  = _first_token_text(output_ids[b])
 
-        # ===== 지표 집계 =====
-        if total_tokens > 0:
-            avg_loss  = total_loss / total_tokens        # teacher-forcing loss (진단용)
-        else:
-            avg_loss = float('nan')
+                    print(f"> 첫 토큰 비교 | 예측: {pred_first} / 정답: {gold_first}\n")
+                    print(f"\t샘플 {printed_samples+1}:")
+                    print(f"\t> 입력: {input_text}")
+                    print(f"\t> 예측: {pred_text}")
+                    print(f"\t> 정답: {output_text}")
+                    printed_samples += 1
 
-        # free-running 기준 토큰 정확도/편집 지표
-        token_acc = correct_tokens / total_eval_non_pad if total_eval_non_pad > 0 else 0.0
-        precision = (correct_edits / total_pred_edits) if total_pred_edits > 0 else 0.0
-        recall    = (correct_edits / total_gold_edits) if total_gold_edits > 0 else 0.0
+            num_samples += B
+
+            # 5) (옵션) TF-loss/acc 진단 — 빠르게 보고 싶을 때만
+            if diag_tf:
+                with torch.no_grad():
+                    dec_inp = output_ids[:, :-1]
+                    target  = output_ids[:,  1:]
+                    logits  = model(input_ids, input_lengths, dec_inp)  # (B, T-1, V)
+                    logits_f = logits.view(-1, logits.size(-1))
+                    target_f = target.contiguous().view(-1)
+                    loss = criterion(logits_f, target_f)
+                    nonpad = (target_f != self.PAD_TOKEN_ID).sum().item()
+                    tf_total_loss += loss.item() * nonpad
+                    tf_total_tok  += nonpad
+
+                    pred_tf = logits.argmax(dim=-1)  # (B, T-1)
+                    tf_correct_tok += ((pred_tf == target) & (target != self.PAD_TOKEN_ID)).sum().item()
+
+        # --------- 집계 ---------
+        precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+        recall    = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
         beta = 0.5
         f0_5 = (1 + beta**2) * precision * recall / (beta**2 * precision + recall) if (precision + recall) > 0 else 0.0
 
-        print(f"\n>> Validation 결과 (epoch {epoch_num}) [free-running]:")
-        print(f"   (TF-loss 진단) 평균 손실: {avg_loss:.4f}")
-        print(f"   Token Acc: {token_acc:.4f}")
+        print(f"\n>> Validation 결과 (epoch {epoch_num}) [beam={beam_size}, α={length_alpha}, rep={repetition_penalty}, ngr={no_repeat_ngram_size}]")
         print(f"   Precision: {precision:.4f}, Recall: {recall:.4f}, F0.5: {f0_5:.4f}")
+
+        if diag_tf and tf_total_tok > 0:
+            tf_avg_loss = tf_total_loss / tf_total_tok
+            tf_acc = tf_correct_tok / tf_total_tok
+            print(f"   (TF 진단) Avg Loss: {tf_avg_loss:.4f}, Token Acc: {tf_acc:.4f}")
+
+        # --------- ERRANT 덤프 저장 ---------
+        if dump_for_errant:
+            dump_root = os.path.join(transformer_path, dump_dir_name, f"epoch_{epoch_num if epoch_num>=0 else 'NA'}")
+            os.makedirs(dump_root, exist_ok=True)
+            src_path = os.path.join(dump_root, "src.txt")
+            hyp_path = os.path.join(dump_root, "hyp.txt")
+            ref_path = os.path.join(dump_root, "ref.txt")
+
+            with open(src_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(dump_src))
+            with open(hyp_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(dump_hyp))
+            with open(ref_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(dump_ref))
+
+            print(f"\n[ERRANT 덤프] 저장 완료:")
+            print(f"  SRC: {src_path}")
+            print(f"  HYP: {hyp_path}")
+            print(f"  REF: {ref_path}")
+            print("  → 외부 스크립트로 ERRANT 채점 실행 권장 (언어 리소스/토크나이저 준비 필요)")
+
 
 if __name__ == '__main__':
     tne = pNup_s2s()
