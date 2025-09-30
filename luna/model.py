@@ -5,7 +5,7 @@ import torch.nn as nn
 from transformer.luna.embedding import PositionalEncoding
 from transformer.luna.encoder import LunaTransformerEncoderLayer
 from transformer.luna.mask import get_attn_pad_mask, get_attn_subsequent_mask
-from transformer.code_transformer.transformer import DecoderBlock
+from transformer.code_transformer.transformer import DecoderBlock, EncoderBlock
 from transformer.basic_transformer.attention import _Embedding
 
 class LunaTransformerEncoder(nn.Module):
@@ -100,7 +100,13 @@ class LunaTransformer(nn.Module):
         self.PAD_TOKEN_ID = 0
 
         self.embedding = _Embedding(d_model, vocab_size, max_length, self.device, dropout_p)
-        self.encoder_layers = LunaTransformerEncoder(vocab_size, d_model, num_layers, num_attention_heads, d_ff, dropout_p, project_embedding_length, max_length)
+        #self.encoder_layers = LunaTransformerEncoder(vocab_size, d_model, num_layers, num_attention_heads, d_ff, dropout_p, project_embedding_length, max_length)
+        #"""
+        self.encoder_layers = nn.ModuleList([
+            EncoderBlock(d_model, num_attention_heads, d_ff, dropout_p)
+            for _ in range(num_layers)
+        ])
+        #"""
         self.decoder_layers = nn.ModuleList([
             DecoderBlock(d_model, num_attention_heads, d_ff, dropout_p)
             for _ in range(num_layers)
@@ -117,8 +123,12 @@ class LunaTransformer(nn.Module):
         
         # 인코더
         enc_input = src
-        enc_output = self.encoder_layers(enc_input, src_lengths)
-
+        #enc_output = self.encoder_layers(enc_input, src_lengths)
+        #"""
+        enc_output = self.embedding(enc_input)
+        for layer in self.encoder_layers:
+            enc_output = layer(enc_output)
+        #"""
         # mask
         enc_pad_mask = get_attn_pad_mask(src, src_lengths, expand_length=T)
         enc_pad_mask  = (1.0 - enc_pad_mask.float()).unsqueeze(1)

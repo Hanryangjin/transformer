@@ -63,7 +63,7 @@ class ScaleDotProductAttention(nn.Module):
         score = (q @ k_t) / math.sqrt(d_model)  # scaled dot product
 
         if mask is not None:
-            score = score.masked_fill(mask == 0, -10000)
+            score = score.masked_fill(mask == 0, -1e4)
 
         score = self.softmax(score)
         v = score @ v
