@@ -1,3 +1,15 @@
+# -*- coding: utf-8 -*-
+"""
+KoBERT(monologg/kobert) 기반 GEC 태깅 멀티태스크 학습 스크립트 (GECToR 스타일 수정 적용)
+- 학습 데이터: ./transformer/TrainData/kogector_extended.json
+- 적용 변경:
+  1) 추론 임계치: MIN_ERROR_PROB / ADDITIONAL_KEEP_LOGIT
+  2) 반복(Iterative) 검증 디코딩: N_ITER
+  3) 비-KEEP 가중 label-smoothed CE
+  4) Cold epochs: 초기 몇 epoch 백본 freeze
+  5) tqdm / 예시 5개 / PRF0.5 / ckpt 저장( state_dict )
+"""
+
 import os
 import json
 import math
@@ -44,20 +56,54 @@ WARMUP_RATIO = 0.1
 MAX_LEN = 128
 GRAD_ACCUM_STEPS = 1
 WEIGHT_DECAY = 0.01
+CLIP_NORM = 1.0  # 선택: grad clipping
 
 # 멀티태스크 손실 가중치
 LOSS_WEIGHT_TOKEN = 1.0
 LOSS_WEIGHT_BOUND = 0.5
-LOSS_WEIGHT_PART  = 0.75
+LOSS_WEIGHT_PART  = 0.75  # (현재 loss 미포함)
 
 # 평가/출력 관련
 NUM_SHOW_SAMPLES = 5   # 매 에포크마다 예시 출력 개수
 
+# ====== GECToR 스타일 하이퍼 ======
+# 1) 토큰 임계치/바이어스
+MIN_ERROR_PROB = 0.30          # (1 - P(KEEP)) < MIN_ERROR_PROB 이면 KEEP 강제
+ADDITIONAL_KEEP_LOGIT = 0.20   # KEEP 로그잇에 가산 바이어스(>0이면 보수적)
+# 2) 반복 추론 횟수 (검증 시)
+N_ITER = 3                     # 1회차는 배치 출력, 2~N회는 단문 재호출
+# 3) 비-KEEP 가중치 (손실)
+TOKEN_NON_KEEP_WEIGHT = 3.0
+BOUND_NON_KEEP_WEIGHT = 2.0
+# 4) Cold epochs
+COLD_EPOCHS = 1                # 처음 1 epoch 백본 freeze
+
+# ----------------------------------------------------
+# Label-smoothed loss (class weight 지원)
+# ----------------------------------------------------
+def label_smoothed_loss(pred, target, epsilon=0.1, ignore_index=-100, class_weight=None):
+    V = pred.size(-1)
+    log_probs = torch.nn.functional.log_softmax(pred, dim=-1)
+    mask = (target != ignore_index)
+    if mask.sum() == 0:
+        return pred.new_tensor(0.0)
+    target_clamped = target.clone()
+    target_clamped[~mask] = 0
+    one_hot = torch.nn.functional.one_hot(target_clamped, num_classes=V).float()
+    smoothed = (1 - epsilon) * one_hot + (epsilon / V)
+    if class_weight is not None:
+        # class_weight: [V]
+        smoothed = smoothed * class_weight.unsqueeze(0)
+        # 정규화(선택): smoothed 합이 1 근사 유지하도록
+        denom = smoothed.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        smoothed = smoothed / denom
+    loss_per_tok = -(smoothed * log_probs).sum(dim=-1)
+    loss = loss_per_tok[mask].mean()
+    return loss
+
 # ----------------------------------------------------
 # 데이터 유틸
 # ----------------------------------------------------
-# JSON 파일 로드 / token_labels, boundary_labels, particle_labels 포함
-# 현 상황에서 학습 능력 떨어지면, 각각을 분리하여 받아들이는 것으로 수정. => 현재 JSONL에서 JSON으로 바꾼 탓에 문제 발생 가능성 있음.
 def load_examples(path: str) -> List[Dict[str, Any]]:
     if not path or not os.path.exists(path):
         return []
@@ -145,11 +191,6 @@ class GECTagDataset(Dataset):
                     mapped = label2id.get(lb, label2id.get("KEEP", 0))
                     aligned.append(mapped)
             aligned.append(IGNORE_LABEL)
-            # 라벨 매핑 검증: 모두 IGNORE_LABEL(-100)일 경우 경고 출력
-            """
-            if all(x == IGNORE_LABEL for x in aligned):
-                print(f"[경고] 모든 라벨이 IGNORE_LABEL(-100)로 매핑됨: {raw_labels}")
-                """
             return aligned
 
         token_labels = align_labels(ex.get("token_labels", []), self.label_meta["token2id"])
@@ -203,9 +244,6 @@ def collate_fn(batch):
 # KoBERT SPM 호환성 점검(선택)
 # ----------------------------------------------------
 def check_spm_coverage(tokenizer, samples, top_n=2000):
-    """
-    KoBERT tokenizer로 pieces를 ID로 변환할 때 OOV나 경계 불일치를 대략 점검.
-    """
     unk_id = tokenizer.unk_token_id
     oov, total = 0, 0
     boundary_mismatch = 0
@@ -219,8 +257,7 @@ def check_spm_coverage(tokenizer, samples, top_n=2000):
             boundary_mismatch += 1
     oov_rate = (oov / max(1, total)) * 100
     if oov_rate > 5.0 or boundary_mismatch > 0:
-        print(f"[경고] KoBERT SPM과의 어휘/경계 불일치 가능성: OOV {oov_rate:.2f}%, "
-              f"경계불일치 샘플 {boundary_mismatch}")
+        print(f"[경고] KoBERT SPM 불일치 가능성: OOV {oov_rate:.2f}%, 경계불일치 샘플 {boundary_mismatch}")
     else:
         print(f"[OK] KoBERT SPM 커버리지 양호: OOV {oov_rate:.2f}%")
 
@@ -244,7 +281,8 @@ class MultiHeadGECTagger(nn.Module):
         self.head_part  = nn.Linear(hidden, self.num_part)
 
     def forward(self, input_ids, attention_mask=None, token_type_ids=None,
-                token_labels=None, boundary_labels=None, particle_labels=None):
+                token_labels=None, boundary_labels=None, particle_labels=None,
+                loss_f_token=None, loss_f_bound=None):
         outputs = self.bert(input_ids=input_ids,
                             attention_mask=attention_mask,
                             token_type_ids=token_type_ids)
@@ -255,18 +293,27 @@ class MultiHeadGECTagger(nn.Module):
         logits_part  = self.head_part(seq_out)
 
         loss = None
-        if (token_labels is not None) or (boundary_labels is not None) or (particle_labels is not None):
-            loss_f = nn.CrossEntropyLoss(ignore_index=IGNORE_LABEL)
+        # 조사(part)는 loss 미포함(원 코드 유지)
+        if (token_labels is not None) or (boundary_labels is not None):
             loss = 0.0
             if token_labels is not None:
-                loss += LOSS_WEIGHT_TOKEN * loss_f(logits_token.view(-1, logits_token.size(-1)),
-                                                   token_labels.view(-1))
+                if loss_f_token is None:
+                    loss_f_token = lambda pred, tgt: label_smoothed_loss(
+                        pred, tgt, epsilon=0.1, ignore_index=IGNORE_LABEL
+                    )
+                loss += LOSS_WEIGHT_TOKEN * loss_f_token(
+                    logits_token.view(-1, logits_token.size(-1)),
+                    token_labels.view(-1)
+                )
             if boundary_labels is not None:
-                loss += LOSS_WEIGHT_BOUND * loss_f(logits_bound.view(-1, logits_bound.size(-1)),
-                                                   boundary_labels.view(-1))
-            if particle_labels is not None:
-                loss += LOSS_WEIGHT_PART * loss_f(logits_part.view(-1, logits_part.size(-1)),
-                                                  particle_labels.view(-1))
+                if loss_f_bound is None:
+                    loss_f_bound = lambda pred, tgt: label_smoothed_loss(
+                        pred, tgt, epsilon=0.1, ignore_index=IGNORE_LABEL
+                    )
+                loss += LOSS_WEIGHT_BOUND * loss_f_bound(
+                    logits_bound.view(-1, logits_bound.size(-1)),
+                    boundary_labels.view(-1)
+                )
 
         return {
             "loss": loss,
@@ -276,10 +323,9 @@ class MultiHeadGECTagger(nn.Module):
         }
 
 # ----------------------------------------------------
-# 디코더: 태그 → 최종 문장(String)
+# 디코더/평가 유틸
 # ----------------------------------------------------
 def _strip_leading_bar(token: str) -> Tuple[str, bool]:
-    # SentencePiece의 ▁는 단어 경계(공백)를 의미
     if token.startswith("▁"):
         return token[1:], True
     return token, False
@@ -288,11 +334,9 @@ def apply_tags_to_sentence(pieces: List[str],
                            token_label_strs: List[str],
                            boundary_label_strs: List[str],
                            particle_label_strs: List[str]) -> str:
-    """ pieces와 세 가지 레이블 문자열을 받아 최종 문장 생성 """
     out_tokens: List[str] = []
-    spaces_after: List[bool] = []  # 각 토큰 뒤에 공백을 둘지 여부
+    spaces_after: List[bool] = []
 
-    # 1) 토큰 단위 조작 (조사 레이블 우선)
     i = 0
     while i < len(pieces):
         tok = pieces[i]
@@ -301,7 +345,6 @@ def apply_tags_to_sentence(pieces: List[str],
         t_lab = token_label_strs[i] if i < len(token_label_strs) else "KEEP"
         p_lab = particle_label_strs[i] if i < len(particle_label_strs) else "KEEP"
 
-        # 조사 레이블 우선 적용 (REPLACE_x / KEEP / 기타)
         effective_label = p_lab if (p_lab != str(IGNORE_LABEL) and p_lab != "-100" and p_lab != "KEEP") else t_lab
 
         if effective_label.startswith("REPLACE_"):
@@ -309,20 +352,18 @@ def apply_tags_to_sentence(pieces: List[str],
             out_tokens.append(new_tok)
             spaces_after.append(sp_boundary)
         elif effective_label.startswith("INSERT_"):
-            # 현재 토큰은 유지, 뒤에 삽입 토큰 추가
             out_tokens.append(base_tok)
             spaces_after.append(sp_boundary)
             ins_tok = effective_label.split("INSERT_", 1)[1]
             out_tokens.append(ins_tok)
-            spaces_after.append(False)  # 삽입 토큰 뒤 공백은 기본 False
+            spaces_after.append(False)
         elif effective_label == "DELETE":
-            pass  # 삭제
-        else:  # KEEP or 기타
+            pass
+        else:
             out_tokens.append(base_tok)
             spaces_after.append(sp_boundary)
         i += 1
 
-    # 2) 경계(띄어쓰기) 조정
     for i in range(len(out_tokens) - 1):
         if i+1 < len(boundary_label_strs):
             b = boundary_label_strs[i+1]
@@ -330,9 +371,7 @@ def apply_tags_to_sentence(pieces: List[str],
                 spaces_after[i] = True
             elif b == "SPACE_DEL":
                 spaces_after[i] = False
-            # KEEP이면 SPM 기본값 유지
 
-    # 3) 문자열 조립
     s = []
     for i, tok in enumerate(out_tokens):
         if i == 0:
@@ -343,14 +382,7 @@ def apply_tags_to_sentence(pieces: List[str],
             s.append(tok)
     return "".join(s)
 
-# ----------------------------------------------------
-# 간이 편집 기반 P/R/F0.5
-# ----------------------------------------------------
 def word_edits(src: str, dst: str) -> List[Tuple[str, Tuple[int,int], Tuple[int,int]]]:
-    """
-    단어 단위로 src→dst의 편집을 추출.
-    반환: (op, (i0,i1), (j0,j1)) where op in {"insert","delete","replace"}
-    """
     src_tok = src.split()
     dst_tok = dst.split()
     sm = SequenceMatcher(a=src_tok, b=dst_tok)
@@ -367,13 +399,10 @@ def word_edits(src: str, dst: str) -> List[Tuple[str, Tuple[int,int], Tuple[int,
     return edits
 
 def prf05_from_edits(src: str, hyp: str, tgt: str) -> Tuple[float,float,float]:
-    """
-    gold = src→tgt, pred = src→hyp 편집 집합 비교로 P/R/F0.5 계산
-    """
     gold = word_edits(src, tgt)
     pred = word_edits(src, hyp)
 
-    def normalize(edits, src_text, dst_text):
+    def normalize(edits, dst_text):
         dst_tok = dst_text.split()
         norm = []
         for op, (i0,i1), (j0,j1) in edits:
@@ -381,8 +410,8 @@ def prf05_from_edits(src: str, hyp: str, tgt: str) -> Tuple[float,float,float]:
             norm.append((op, i1-i0, j1-j0, dst_segment))
         return set(norm)
 
-    G = normalize(gold, src, tgt)
-    P = normalize(pred, src, hyp)
+    G = normalize(gold, tgt)
+    P = normalize(pred, hyp)
 
     tp = len(G & P)
     fp = len(P - G)
@@ -397,9 +426,6 @@ def prf05_from_edits(src: str, hyp: str, tgt: str) -> Tuple[float,float,float]:
         f05 = (1 + beta2) * prec * rec / (beta2 * prec + rec)
     return prec, rec, f05
 
-# ----------------------------------------------------
-# 마스크드 정확도(참고용)
-# ----------------------------------------------------
 @torch.no_grad()
 def masked_accuracy(logits: torch.Tensor, labels: torch.Tensor) -> float:
     preds = logits.argmax(dim=-1)
@@ -407,6 +433,63 @@ def masked_accuracy(logits: torch.Tensor, labels: torch.Tensor) -> float:
     correct = (preds.eq(labels) & mask).sum().item()
     total = mask.sum().item()
     return (correct / total) if total > 0 else 0.0
+
+# ----------------------------------------------------
+# 임계치/바이어스 적용 태그 디코딩 (1회)
+# ----------------------------------------------------
+@torch.no_grad()
+def decode_with_thresholds_from_logits(
+    logits_token: torch.Tensor, logits_bound: torch.Tensor, logits_part: torch.Tensor,
+    pieces: List[str], id2token: Dict[int,str], id2bound: Dict[int,str], id2part: Dict[int,str],
+    keep_id: int
+) -> Tuple[str, List[str], List[str], List[str]]:
+    """
+    배치 내 특정 문장에 대한 logits → (hyp sentence, token_strs, bound_strs, part_strs)
+    logits_*: [L, C] (CLS/SEP 포함된 상태라면 caller에서 잘라서 넘겨야 함)
+    """
+    # KEEP 바이어스(로그잇에 가산) → softmax
+    biased_token_logits = logits_token.clone()
+    biased_token_logits[..., keep_id] += ADDITIONAL_KEEP_LOGIT
+    probs = torch.softmax(biased_token_logits, dim=-1)  # [L, Ct]
+
+    # 임계치 적용: error_prob = 1 - P(KEEP)
+    keep_prob = probs[..., keep_id]
+    error_prob = 1.0 - keep_prob
+    pred_token = probs.argmax(-1)  # [L]
+    pred_token = torch.where(error_prob >= MIN_ERROR_PROB, pred_token, torch.full_like(pred_token, keep_id))
+
+    token_strs = [id2token[int(x)] for x in pred_token]
+    bound_strs = [id2bound[int(x)] for x in logits_bound.argmax(-1)]
+    part_strs  = [id2part[int(x)]  for x in logits_part.argmax(-1)]
+
+    # 최종 문장 조립
+    hyp = apply_tags_to_sentence(pieces, token_strs, bound_strs, part_strs)
+    return hyp, token_strs, bound_strs, part_strs
+
+# ----------------------------------------------------
+# 단문 forward + 디코딩(토크나이처 pieces 입력)
+# ----------------------------------------------------
+@torch.no_grad()
+def forward_on_pieces(model, tok, pieces: List[str], id_maps, keep_id: int) -> str:
+    # [CLS] + pieces + [SEP]
+    input_ids = tok.convert_tokens_to_ids([tok.cls_token] + pieces + [tok.sep_token])
+    attn = [1] * len(input_ids)
+    type_ids = [0] * len(input_ids)
+    input_ids = torch.tensor(input_ids, dtype=torch.long, device=DEVICE).unsqueeze(0)
+    attn = torch.tensor(attn, dtype=torch.long, device=DEVICE).unsqueeze(0)
+    type_ids = torch.tensor(type_ids, dtype=torch.long, device=DEVICE).unsqueeze(0)
+
+    out = model(input_ids=input_ids, attention_mask=attn, token_type_ids=type_ids)
+    # CLS/SEP 제외
+    lt = out["logits_token"][0, 1:-1, :]
+    lb = out["logits_bound"][0, 1:-1, :]
+    lp = out["logits_part"][0, 1:-1, :]
+
+    hyp, *_ = decode_with_thresholds_from_logits(
+        lt, lb, lp, pieces,
+        id_maps["id2token"], id_maps["id2bound"], id_maps["id2part"], keep_id
+    )
+    return hyp
 
 # ----------------------------------------------------
 # 학습/평가
@@ -423,6 +506,20 @@ def print_label_distribution(items, name):
     print(f"[{name}] boundary_labels 분포: {dict(b_counter)}")
     print(f"[{name}] particle_labels 분포: {dict(p_counter)}")
 
+def build_class_weight_vector(labels: List[str], pivot_keep: str, non_keep_weight: float, device) -> torch.Tensor:
+    V = len(labels)
+    w = torch.ones(V, dtype=torch.float, device=device)
+    if pivot_keep in labels:
+        keep_id = labels.index(pivot_keep)
+        for i in range(V):
+            if i != keep_id:
+                w[i] = non_keep_weight
+    return w
+
+def freeze_backbone(m: nn.Module, freeze: bool):
+    for p in m.bert.parameters():
+        p.requires_grad = not freeze
+
 def train_and_eval():
     train_items = load_examples(TRAIN_JSON_PATH)
     val_items = load_examples(VAL_JSON_PATH) if VAL_JSON_PATH and os.path.exists(VAL_JSON_PATH) else []
@@ -438,16 +535,11 @@ def train_and_eval():
 
     # KoBERT 토크나이저 로드
     tok = AutoTokenizer.from_pretrained(MODEL_PATH, use_fast=False)
-    # 스페셜 토큰 보강(대개 필요 없지만 안전 차원)
     add_map = {}
-    if tok.special_tokens_map.get("unk_token") is None:
-        add_map["unk_token"] = "[UNK]"
-    if tok.special_tokens_map.get("sep_token") is None:
-        add_map["sep_token"] = "[SEP]"
-    if tok.special_tokens_map.get("cls_token") is None:
-        add_map["cls_token"] = "[CLS]"
-    if tok.special_tokens_map.get("pad_token") is None:
-        add_map["pad_token"] = "[PAD]"
+    if tok.special_tokens_map.get("unk_token") is None: add_map["unk_token"] = "[UNK]"
+    if tok.special_tokens_map.get("sep_token") is None: add_map["sep_token"] = "[SEP]"
+    if tok.special_tokens_map.get("cls_token") is None: add_map["cls_token"] = "[CLS]"
+    if tok.special_tokens_map.get("pad_token") is None: add_map["pad_token"] = "[PAD]"
     if add_map: tok.add_special_tokens(add_map)
 
     # 검증 데이터 없으면 train에서 일부 분리
@@ -466,9 +558,22 @@ def train_and_eval():
     val_dl   = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
 
     model = MultiHeadGECTagger(MODEL_PATH, label_meta).to(DEVICE)
-    # 토크나이저 크기 변경 시 임베딩 리사이즈
     if hasattr(tok, "__len__") and len(tok) != model.config.vocab_size:
         model.bert.resize_token_embeddings(len(tok))
+
+    # ===== 비-KEEP 가중치 벡터 =====
+    token_class_weight = build_class_weight_vector(
+        label_meta["token_labels"], "KEEP", TOKEN_NON_KEEP_WEIGHT, DEVICE
+    )
+    bound_class_weight = build_class_weight_vector(
+        label_meta["boundary_labels"], "KEEP", BOUND_NON_KEEP_WEIGHT, DEVICE
+    )
+
+    # 손실 래퍼 (고정 파라미터 주입)
+    def loss_f_token_fn(pred, tgt):
+        return label_smoothed_loss(pred, tgt, epsilon=0.1, ignore_index=IGNORE_LABEL, class_weight=token_class_weight)
+    def loss_f_bound_fn(pred, tgt):
+        return label_smoothed_loss(pred, tgt, epsilon=0.1, ignore_index=IGNORE_LABEL, class_weight=bound_class_weight)
 
     # 옵티마이저/스케줄러
     no_decay = ["bias", "LayerNorm.weight"]
@@ -488,9 +593,15 @@ def train_and_eval():
     id2bound = label_meta["id2bound"]
     id2part  = label_meta["id2part"]
 
+    keep_id = label_meta["token2id"]["KEEP"]
+    id_maps = {"id2token": id2token, "id2bound": id2bound, "id2part": id2part}
+
     best_score = -1.0
 
     for epoch in range(1, EPOCHS + 1):
+        # Cold epochs: 백본 freeze
+        freeze_backbone(model, freeze=(epoch <= COLD_EPOCHS))
+
         # ----------------- Train -----------------
         model.train()
         total_loss = 0.0
@@ -505,9 +616,16 @@ def train_and_eval():
                         token_type_ids=batch["token_type_ids"],
                         token_labels=batch["token_labels"],
                         boundary_labels=batch["boundary_labels"],
-                        particle_labels=batch["particle_labels"])
+                        particle_labels=batch["particle_labels"],
+                        loss_f_token=loss_f_token_fn,
+                        loss_f_bound=loss_f_bound_fn)
+
             loss = out["loss"] / GRAD_ACCUM_STEPS
             loss.backward()
+
+            if CLIP_NORM is not None and CLIP_NORM > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP_NORM)
+
             total_loss += loss.item()
             if step % GRAD_ACCUM_STEPS == 0:
                 optimizer.step(); scheduler.step(); optimizer.zero_grad()
@@ -522,7 +640,7 @@ def train_and_eval():
         n_batches = 0
 
         vbar = tqdm(enumerate(val_dl, 1), total=len(val_dl), desc=f"Epoch {epoch} [valid]")
-        all_samples_buffer = []  # 예시 출력용 저장
+        all_samples_buffer = []
 
         with torch.no_grad():
             for step, batch in vbar:
@@ -545,25 +663,34 @@ def train_and_eval():
                 acc_part  += masked_accuracy(out["logits_part"],  batch["particle_labels"])
                 n_batches += 1
 
-                # --------- 예측 디코딩 및 R/P/F0.5 누적 ----------
-                logits_token = out["logits_token"].cpu()
-                logits_bound = out["logits_bound"].cpu()
-                logits_part  = out["logits_part"].cpu()
+                # --------- 1회차: 배치 logits 기반 디코딩(임계치/바이어스 적용) ----------
+                lt = out["logits_token"].cpu()
+                lb = out["logits_bound"].cpu()
+                lp = out["logits_part"].cpu()
 
-                pred_t_ids = logits_token.argmax(-1)  # [B, L]
-                pred_b_ids = logits_bound.argmax(-1)
-                pred_p_ids = logits_part.argmax(-1)
-
+                # 문장 단위 루프
                 for b_idx, pieces in enumerate(batch["raw_pieces"]):
                     L = len(pieces)
-                    token_strs = [id2token[int(x)] for x in pred_t_ids[b_idx][1:1+L]]
-                    bound_strs = [id2bound[int(x)] for x in pred_b_ids[b_idx][1:1+L]]
-                    part_strs  = [id2part[int(x)]  for x in pred_p_ids[b_idx][1:1+L]]
-
-                    hyp = apply_tags_to_sentence(pieces, token_strs, bound_strs, part_strs)
+                    # CLS/SEP 제외한 구간의 logits만 잘라서 1회차 디코딩
+                    hyp, _, _, _ = decode_with_thresholds_from_logits(
+                        lt[b_idx][1:1+L, :], lb[b_idx][1:1+L, :], lp[b_idx][1:1+L, :],
+                        pieces, id2token, id2bound, id2part, keep_id
+                    )
                     src = batch["metas"][b_idx].get("src", "")
                     tgt = batch["metas"][b_idx].get("tgt", "")
 
+                    # --------- 반복(Iterative) 디코딩 2~N회 ----------
+                    prev_hyp = hyp
+                    for it in range(2, N_ITER + 1):
+                        # hyp를 토크나이즈 → 단문 forward → 다시 디코드
+                        hyp_pieces = tok.tokenize(prev_hyp)
+                        new_hyp = forward_on_pieces(model, tok, hyp_pieces, id_maps, keep_id)
+                        if new_hyp == prev_hyp:
+                            break  # 변화 없으면 조기 종료
+                        prev_hyp = new_hyp
+                    hyp = prev_hyp
+
+                    # ------- 문장 단위 PRF 누적 -------
                     p, r, f05 = prf05_from_edits(src, hyp, tgt)
                     pr_sum += p; rc_sum += r; f05_sum += f05
 
@@ -606,27 +733,20 @@ def train_and_eval():
             best_score = score
             save_dir = f"./ckpt_epoch{epoch}_F05_{best_score:.4f}"
             os.makedirs(save_dir, exist_ok=True)
-            # 모델/토크나이저/라벨메타 저장 (HF가 아닌 torch.save 방식)
-            os.makedirs(save_dir, exist_ok=True)
 
-            # 1) 전체 파라미터 저장
             torch.save(
                 {
                     "state_dict": (model.module.state_dict() if hasattr(model, "module") else model.state_dict()),
-                    "label_meta": label_meta,  # 그대로 담아두면 로드시 사용
-                    "backbone_name": MODEL_PATH,  # 백본 재구성 정보
+                    "label_meta": label_meta,
+                    "backbone_name": MODEL_PATH,
                 },
                 os.path.join(save_dir, "model.ckpt")
             )
-
-            # 2) 토크나이저 저장 (KoBERT는 save_pretrained에서 TypeError 발생 가능)
             try:
                 tok.save_pretrained(save_dir)
             except TypeError:
-                # KoBERT 토크나이저는 save_vocabulary에 filename_prefix 인자를 지원하지 않음
                 tok.save_vocabulary(save_dir)
 
-            # 3) (선택) 라벨 메타 별도 JSON 백업
             with open(os.path.join(save_dir, "label_meta.json"), "w", encoding="utf-8") as f:
                 json.dump({
                     "token_labels": label_meta["token_labels"],
@@ -635,24 +755,14 @@ def train_and_eval():
                 }, f, ensure_ascii=False, indent=2)
 
 def load_checkpoint(ckpt_dir: str, device: torch.device = DEVICE) -> tuple:
-    """
-    ckpt_dir 안의 model.ckpt / tokenizer 파일들을 읽어
-    (model, tokenizer, label_meta) 를 리턴.
-    """
-    # 토크나이저 로드
     tok = AutoTokenizer.from_pretrained(ckpt_dir, use_fast=False)
-
-    # 가중치/메타 로드
     payload = torch.load(os.path.join(ckpt_dir, "model.ckpt"), map_location=device)
     label_meta = payload["label_meta"]
     backbone_name = payload.get("backbone_name", "monologg/kobert")
-
-    # 모델 재구성 후 state_dict 로드
     model = MultiHeadGECTagger(backbone_name, label_meta).to(device)
     model.load_state_dict(payload["state_dict"], strict=True)
     model.eval()
     return model, tok, label_meta
-
 
 if __name__ == "__main__":
     train_and_eval()

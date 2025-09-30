@@ -128,6 +128,15 @@ def _strip_special(ids, BOS, EOS, PAD):
         ids = ids[:ids.index(EOS)]
     return [t for t in ids if t != PAD]
 
+def _lev_edit_rate(a, b):  # a,b: token id list
+    sm = difflib.SequenceMatcher(a=a, b=b)
+    edits = 0; tgt_len = len(b)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == 'replace': edits += max(i2 - i1, j2 - j1)
+        elif tag == 'delete': edits += (i2 - i1)
+        elif tag == 'insert': edits += (j2 - j1)
+    return edits / max(1, tgt_len)
+
 def edit_counts_via_alignment(src_tokens, tgt_tokens, hyp_tokens):
     """
     src→tgt, src→hyp 변환에서 비-동일 구간을 편집으로 보고,
@@ -150,6 +159,15 @@ def edit_counts_via_alignment(src_tokens, tgt_tokens, hyp_tokens):
     fp = max(0, len(pred_spans) - tp)
     fn = max(0, len(gold_spans) - tp)
     return tp, fp, fn
+
+# 예측값에서 EOS 이후는 모두 PAD로 변환
+def eos_to_pad(ids, eos_id, pad_id):
+    ids = ids.copy() if isinstance(ids, list) else list(ids)
+    if eos_id in ids:
+        first_eos = ids.index(eos_id)
+        for i in range(first_eos + 1, len(ids)):
+            ids[i] = pad_id
+    return ids
 
 """
     train, evaluate 함수는 하나로 두고, 파라미터를 통해 모델을 제어할 수 있도록 수정.
@@ -242,7 +260,7 @@ class pNup_s2s:
         for epoch in range(latest_checknum, self.EPOCHS + latest_checknum):        
             epoch_gold_edit_tok = 0
             epoch_pred_edit_tok = 0
-            epoch_nonpad_tok    = 0
+            epoch_nonpad_tok    = 0 
 
             epoch_align_tp = 0
             epoch_align_fp = 0
@@ -289,13 +307,20 @@ class pNup_s2s:
                 target          = output_ids[:, 1:]     # 정답
                 optimizer.zero_grad()
 
+                """ 디버깅용 출력 (첫 배치에 대해서만) """
+                if batch_idx == 0:
+                    print("input_ids[0]:", input_ids[0].tolist())
+                    print("output_ids[0]:", output_ids[0].tolist())
+                    print("target[0]:", target[0].tolist())
+                    # target은 output_ids[:, 1:] 등으로 생성된 값
+
                 # ---- 1차 forward: teacher-forcing으로 예측 수집 ----
                 with torch.no_grad():
                     logits_tf = model(input_ids, input_lengths, decoder_input)  # (B, T-1, V)
                     next_pred = logits_tf.argmax(dim=-1)                        # (B, T-1)
 
                 # ---- 스케줄드 샘플링 확률: 에포크에 따라 점진 증가 ----
-                max_ss = 0.25  # 최댓값(0.1~0.25 권장)
+                max_ss = 0.1  # 최댓값(0.1~0.25 권장)
                 # latest_checknum이 있는 코드 구조를 고려해 진행률 계산
                 ss_prob = min(max_ss, ((epoch - latest_checknum + 1) / self.EPOCHS) * max_ss)
 
@@ -325,6 +350,12 @@ class pNup_s2s:
                 scaler.step(optimizer)
                 scaler.update()
 
+                # 비정상적인 loss 값 체크
+                if not torch.isfinite(loss):
+                    print("[Train] loss is NaN/Inf - skip step")
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
+
                 # --- 훈련 중 진단 로그 계산 ---
                 with torch.no_grad():
                     # 1) 자리맞춤 기반 '편집 비율' 빠른 로그 (gold vs pred_tf)  ※ 배치 전체
@@ -336,7 +367,6 @@ class pNup_s2s:
                     non_pad = (output_ids[:, 1:] != self.PAD_TOKEN_ID)
                     gold_edits_mask = ((output_ids[:, 1:] != input_ids[:, 1:]) & non_pad)
                     pred_edits_mask = ((pred_full[:, 1:]  != input_ids[:, 1:]) & non_pad)
-
 
                     # 토큰 단위로 누적(에포크 전체 기준의 "비율" 계산에 쓰임)
                     epoch_gold_edit_tok += gold_edits_mask.sum().item()
@@ -362,6 +392,14 @@ class pNup_s2s:
                 # 예측
                 pred_ids = outputs.argmax(dim=-1)
                 pred_ids = pred_ids.view(output_ids.size(0), output_ids.size(1) - 1)
+
+                # BOS 토큰 추가 및 EOS 이후 PAD로 변환
+                pred_ids_list = []
+                for i in range(pred_ids.size(0)):
+                    ids = pred_ids[i].cpu().tolist()
+                    ids = eos_to_pad(ids, self.EOS_TOKEN_ID, self.PAD_TOKEN_ID)
+                    pred_ids_list.append(ids)
+                pred_ids = torch.tensor(pred_ids_list, device=outputs.device, dtype=torch.long)
 
                 # 정확도 계산
                 target_2d = target.view(pred_ids.size(0), pred_ids.size(1))
@@ -409,6 +447,31 @@ class pNup_s2s:
                     print(f"[Debug🚨] 비정상 Loss 발생: {loss.item()}")
                     print("[Debug]현재 learning rate:", scheduler.get_last_lr())
                 # --------------------
+
+                if batch_idx == 0:
+                    # 첫 배치의 첫 샘플에 대해 토큰 ID 시퀀스 및 특수 토큰 위치 출력
+                    print("\n[TrainData 샘플 토큰 시퀀스 확인]")
+                    print(f"input_ids[0]: {input_ids[0].tolist()}")
+                    print(f"output_ids[0]: {output_ids[0].tolist()}")
+                    print(f"BOS_TOKEN_ID: {self.BOS_TOKEN_ID}, EOS_TOKEN_ID: {self.EOS_TOKEN_ID}, PAD_TOKEN_ID: {self.PAD_TOKEN_ID}")
+
+                    # 예측값 토큰 시퀀스 (BOS + pred_ids)
+                    pred_ids_with_bos = [self.BOS_TOKEN_ID] + pred_ids[0].cpu().tolist()
+                    print(f"pred_ids[0] : {pred_ids_with_bos}")
+                    """
+                    # 특수 토큰 위치 시각화
+                    def mark_special(ids):
+                        return [
+                            f"{tid}(<BOS>)" if tid == self.BOS_TOKEN_ID else
+                            f"{tid}(<EOS>)" if tid == self.EOS_TOKEN_ID else
+                            f"{tid}(<PAD>)" if tid == self.PAD_TOKEN_ID else
+                            str(tid)
+                            for tid in ids
+                        ]
+                    print("input_ids[0] (마킹):", mark_special(input_ids[0].tolist()))
+                    print("output_ids[0] (마킹):", mark_special(output_ids[0].tolist()))
+                    print("pred_ids[0] (마킹):", mark_special(pred_ids_with_bos))
+                    """
                 
                 # 샘플 출력 (각 에포크마다 5개)
                 if batch_idx < 5:
@@ -458,10 +521,9 @@ class pNup_s2s:
 
             # CSV 기록
             csv_path = f"{transformer_path}/epoch_metrics.csv"
-            write_header = (epoch == 0) and (not os.path.exists(csv_path))
             with open(csv_path, mode="a", newline="") as file:
                 writer = csv.writer(file)
-                if write_header:
+                if epoch == 0:
                     writer.writerow([
                         "epoch", "loss", "edit_ratio", "token_acc", "precision", "recall", "f0.5",
                         "gold_edit_ratio_token_wt", "pred_edit_ratio_token_wt",
