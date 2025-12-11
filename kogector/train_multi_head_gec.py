@@ -50,6 +50,8 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup
 from tqdm import tqdm
 
+import csv
+
 IGNORE_INDEX = -100
 
 
@@ -719,6 +721,10 @@ def _eta_from_pbar(start: float, n_done: int, total: int) -> str:
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     os.makedirs(args.outdir, exist_ok=True)
+    
+    # 에포크별 지표를 저장할 CSV 파일 (엑셀에서 바로 열 수 있음)
+    metrics_path = os.path.join(args.outdir, "metrics.csv")
+    write_header = not os.path.exists(metrics_path)
 
     tok = AutoTokenizer.from_pretrained(args.model, use_fast=False, trust_remote_code=True)
 
@@ -971,6 +977,8 @@ def train(args):
             use_particle=args.use_particle,
         )
 
+        epoch_time = time.time() - t0
+
         msg = (
             f"[Epoch {ep}] train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
             f"acc_token={acc_tok:.4f} | acc_edit={acc_edit:.4f} | "
@@ -981,8 +989,37 @@ def train(args):
                 msg += f" | particle_acc_all={particle_acc_all:.4f}"
             if particle_acc_is is not None:
                 msg += f" | particle_acc_IS={particle_acc_is:.4f}"
-        msg += f" | time={time.time()-t0:.1f}s"
+        msg += f" | time={epoch_time:.1f}s"
         print(msg)
+
+        # === 에포크별 지표 CSV로 저장 ===
+        with open(metrics_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            # 파일이 없어서 처음 여는 경우에만 헤더 기록
+            if write_header:
+                writer.writerow(
+                    ["epoch", "train_loss", "val_loss",
+                     "acc_token", "acc_edit",
+                     "P", "R", "F0.5",
+                     "space_acc", "time_sec"]
+                )
+                write_header = False
+
+            writer.writerow(
+                [
+                    ep,
+                    float(train_loss),
+                    float(val_loss),
+                    float(acc_tok),
+                    float(acc_edit),
+                    float(P),
+                    float(R),
+                    float(F),
+                    float(space_acc),
+                    float(epoch_time),
+                ]
+            )
+
 
         # 프리뷰
         preview_samples(

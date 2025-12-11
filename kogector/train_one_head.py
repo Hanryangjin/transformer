@@ -27,6 +27,8 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup
 from tqdm import tqdm
 
+import csv
+
 IGNORE_INDEX = -100
 
 # ==============================
@@ -491,6 +493,9 @@ def _eta_from_pbar(pbar_start_time: float, n_done: int, total: int) -> str:
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     os.makedirs(args.outdir, exist_ok=True)
+    
+    metrics_path = os.path.join(args.outdir, "metrics.csv")
+    write_header = not os.path.exists(metrics_path)
 
     # tokenizer (convert_tokens_to_ids만 사용; 재토크나이즈 금지)
     tok = AutoTokenizer.from_pretrained(args.model, use_fast=False, trust_remote_code=True)
@@ -649,10 +654,42 @@ def train(args):
 
         acc_tok, acc_edit, P, R, F, space_acc = evaluate(model, valid_dl, id2token, tok, device)
 
-        print(f"[Epoch {ep}] train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
-              f"acc_token={acc_tok:.4f} | acc_edit={acc_edit:.4f} | "
-              f"P={P:.4f} R={R:.4f} F0.5={F:.4f} | "
-              f"space_acc={space_acc:.4f} | time={time.time()-t0:.1f}s")
+        epoch_time = time.time() - t0
+
+        print(
+            f"[Epoch {ep}] train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
+            f"acc_token={acc_tok:.4f} | acc_edit={acc_edit:.4f} | "
+            f"P={P:.4f} R={R:.4f} F0.5={F:.4f} | "
+            f"space_acc={space_acc:.4f} | time={epoch_time:.1f}s"
+        )
+
+        # === 에포크별 지표 CSV로 저장 ===
+        with open(metrics_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            if write_header:
+                writer.writerow(
+                    ["epoch", "train_loss", "val_loss",
+                     "acc_token", "acc_edit",
+                     "P", "R", "F0.5",
+                     "space_acc", "time_sec"]
+                )
+                write_header = False
+
+            writer.writerow(
+                [
+                    ep,
+                    float(train_loss),
+                    float(val_loss),
+                    float(acc_tok),
+                    float(acc_edit),
+                    float(P),
+                    float(R),
+                    float(F),
+                    float(space_acc),
+                    float(epoch_time),
+                ]
+            )
+
 
         # === 에폭별 무작위 프리뷰 (train/valid 각각 k개) ===
         preview_samples(model, tok, id2token, device, train_items, title="train", k=args.preview_k, max_len=args.max_len)
