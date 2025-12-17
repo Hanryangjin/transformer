@@ -854,9 +854,16 @@ def train(args):
     best_f = -1.0
 
     for ep in range(1, args.epochs + 1):
+        # 전체 epoch 시간
+        epoch_start = time.time()
+
+        # -----------------
+        # 1) Train
+        # -----------------
         model.train()
         loss_sum = 0.0
-        t0 = time.time()
+
+        train_start = time.time()  # 순수 학습 시간 시작
 
         pbar = tqdm(train_dl, desc=f"Epoch {ep} [train]", ncols=120)
         pbar_start = time.time()
@@ -869,10 +876,10 @@ def train(args):
             y_part = batch["label_particle_ids"].to(device)
 
             logits_tok, logits_space, logits_part = model(input_ids, attn)
-
-            loss = 0.0
-            loss_tok = criterion_tok(logits_tok.view(-1, logits_tok.size(-1)), y_tok.view(-1))
-            loss = loss + loss_tok
+            loss_tok = criterion_tok(
+                logits_tok.view(-1, logits_tok.size(-1)), y_tok.view(-1)
+            )
+            loss = loss_tok
 
             if args.use_space and criterion_space is not None and logits_space is not None:
                 loss_space = criterion_space(
@@ -912,10 +919,16 @@ def train(args):
             )
 
         train_loss = loss_sum / max(1, len(train_dl))
+        train_time = time.time() - train_start  # 순수 학습 시간
 
-        # ----- 검증 -----
+        # -----------------
+        # 2) Validation
+        # -----------------
         model.eval()
         val_loss_sum = 0.0
+
+        val_start = time.time()  # 순수 검증 시간 시작
+
         with torch.no_grad():
             pbar_v = tqdm(valid_dl, desc=f"Epoch {ep} [valid]", ncols=120)
             pbar_v_start = time.time()
@@ -927,7 +940,9 @@ def train(args):
                 y_part = batch["label_particle_ids"].to(device)
 
                 logits_tok, logits_space, logits_part = model(input_ids, attn)
-                loss_tok = criterion_tok(logits_tok.view(-1, logits_tok.size(-1)), y_tok.view(-1))
+                loss_tok = criterion_tok(
+                    logits_tok.view(-1, logits_tok.size(-1)), y_tok.view(-1)
+                )
                 loss = loss_tok
 
                 if args.use_space and criterion_space is not None and logits_space is not None:
@@ -949,7 +964,11 @@ def train(args):
                 val_loss_sum += loss.item()
                 eta_v = _eta_from_pbar(pbar_v_start, pbar_v.n, pbar_v.total or 1)
                 pbar_v.set_postfix(
-                    {"val_loss": f"{loss.item():.4f}", "tok": f"{loss_tok.item():.4f}", "eta": eta_v}
+                    {
+                        "val_loss": f"{loss.item():.4f}",
+                        "tok": f"{loss_tok.item():.4f}",
+                        "eta": eta_v,
+                    }
                 )
 
         val_loss = val_loss_sum / max(1, len(valid_dl))
@@ -977,7 +996,8 @@ def train(args):
             use_particle=args.use_particle,
         )
 
-        epoch_time = time.time() - t0
+        val_time = time.time() - val_start
+        epoch_time = time.time() - epoch_start
 
         msg = (
             f"[Epoch {ep}] train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
@@ -989,7 +1009,11 @@ def train(args):
                 msg += f" | particle_acc_all={particle_acc_all:.4f}"
             if particle_acc_is is not None:
                 msg += f" | particle_acc_IS={particle_acc_is:.4f}"
-        msg += f" | time={epoch_time:.1f}s"
+        msg += (
+            f" | train_time={train_time:.1f}s"
+            f" | val_time={val_time:.1f}s"
+            f" | total={epoch_time:.1f}s"
+        )
         print(msg)
 
         # === 에포크별 지표 CSV로 저장 ===
@@ -998,10 +1022,14 @@ def train(args):
             # 파일이 없어서 처음 여는 경우에만 헤더 기록
             if write_header:
                 writer.writerow(
-                    ["epoch", "train_loss", "val_loss",
-                     "acc_token", "acc_edit",
-                     "P", "R", "F0.5",
-                     "space_acc", "time_sec"]
+                    [
+                        "epoch",
+                        "train_loss", "val_loss",
+                        "acc_token", "acc_edit",
+                        "P", "R", "F0.5",
+                        "space_acc",
+                        "train_time_sec", "val_time_sec", "time_sec",
+                    ]
                 )
                 write_header = False
 
@@ -1016,10 +1044,11 @@ def train(args):
                     float(R),
                     float(F),
                     float(space_acc),
+                    float(train_time),
+                    float(val_time),
                     float(epoch_time),
                 ]
             )
-
 
         # 프리뷰
         preview_samples(
