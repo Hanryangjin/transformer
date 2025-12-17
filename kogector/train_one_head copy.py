@@ -27,8 +27,6 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup
 from tqdm import tqdm
 
-import csv
-
 IGNORE_INDEX = -100
 
 # ==============================
@@ -211,65 +209,6 @@ def collate_batch(batch, pad_id: int):
             "label_ids": label_ids, "pieces": pieces, "token_labels": token_labels,
             "metas": metas}
 
-def _space_boundaries(s: str):
-    """
-    공백을 제거하지 않고, '문자 사이 경계'마다 공백이 있는지 여부를 bool 리스트로 반환.
-    - s에서 공백이 아닌 문자들의 인덱스를 기록한 뒤,
-    - 각 인접한 두 문자 사이에 하나라도 공백이 끼어 있으면 True.
-    """
-    positions = []
-    for idx, ch in enumerate(s):
-        if ch != " ":
-            positions.append(idx)
-    n = len(positions)
-    if n <= 1:
-        return []
-
-    boundaries = []
-    for k in range(n - 1):
-        i = positions[k]
-        j = positions[k + 1]
-        has_space = False
-        for t in range(i + 1, j):
-            if s[t] == " ":
-                has_space = True
-                break
-        boundaries.append(has_space)
-    return boundaries
-
-def _space_accuracy(pred_texts, gold_texts) -> float:
-    """
-    예측/정답 문자열 리스트를 받아서 '문자 시퀀스가 동일한' 문장들에 대해
-    공백 경계 일치 비율을 계산.
-    - 글자(공백 제외) 시퀀스가 다르면, 띄어쓰기 평가가 애매하므로 해당 문장은 스킵.
-    """
-    total = 0
-    correct = 0
-
-    for pred, gold in zip(pred_texts, gold_texts):
-        if not pred or not gold:
-            continue
-
-        pred_chars = [c for c in pred if c != " "]
-        gold_chars = [c for c in gold if c != " "]
-        if pred_chars != gold_chars:
-            # 문자 내용이 다르면 띄어쓰기 비교가 애매하니 스킵
-            continue
-
-        b_pred = _space_boundaries(pred)
-        b_gold = _space_boundaries(gold)
-        if not b_pred or not b_gold:
-            continue
-
-        m = min(len(b_pred), len(b_gold))
-        for i in range(m):
-            total += 1
-            if b_pred[i] == b_gold[i]:
-                correct += 1
-
-    return correct / max(1, total)
-
-
 # ==============================
 # 2) 모델 (한 헤드 분류)
 # ==============================
@@ -361,13 +300,7 @@ def evaluate(model, loader, id2tok, tokenizer, device):
     n_tok, n_tok_correct = 0, 0
     n_edit, n_edit_correct = 0, 0
 
-    P_all = R_all = F_all = 0.0
-    n_sent = 0
-
-    # 띄어쓰기 평가용 텍스트 모음
-    all_pred_texts = []
-    all_gold_texts = []
-
+    P_all=R_all=F_all=0.0; n_sent=0
     with torch.no_grad():
         for batch in loader:
             input_ids = batch["input_ids"].to(device)
@@ -391,44 +324,25 @@ def evaluate(model, loader, id2tok, tokenizer, device):
             n_edit += edit_mask.sum().item()
             n_edit_correct += ((pred_ids.eq(labels)) & edit_mask).sum().item()
 
-            # sentence-level P/R/F0.5 + 띄어쓰기용 텍스트 수집
-            B, L_max = input_ids.size()
-            for b in range(B):
-                # 실제 토큰 길이
-                valid_len = mask[b].sum().item()
-                if valid_len == 0:
+            # sentence-level P/R/F0.5
+            for b in range(input_ids.size(0)):
+                L = mask[b].sum().item()
+                if L == 0:
                     continue
+                pieces = batch["pieces"][b][:L]
+                gold_actions = [id2tok[labels[b,i].item()] for i in range(L)]
+                pred_actions = [id2tok[pred_ids[b,i].item()] for i in range(L)]
 
-                pieces = batch["pieces"][b][:valid_len]
-                gold_actions = [id2tok[labels[b, i].item()] for i in range(valid_len)]
-                pred_actions = [id2tok[pred_ids[b, i].item()] for i in range(valid_len)]
-
-                # 편집 기반 P/R/F0.5
                 pred_ed = edits_from_actions(pieces, pred_actions)
                 gold_ed = edits_from_actions(pieces, gold_actions)
-                P, R, F = prf_from_editsets(pred_ed, gold_ed, beta=0.5)
-                P_all += P
-                R_all += R
-                F_all += F
-                n_sent += 1
 
-                # 띄어쓰기 평가용 텍스트
-                meta = batch["metas"][b] if "metas" in batch else {}
-                gold_text = meta.get("tgt") or decode_apply_token_actions(pieces, gold_actions)
-                pred_text = decode_apply_token_actions(pieces, pred_actions)
-                all_gold_texts.append(gold_text)
-                all_pred_texts.append(pred_text)
+                P,R,F = prf_from_editsets(pred_ed, gold_ed, beta=0.5)
+                P_all += P; R_all += R; F_all += F; n_sent += 1
 
-    acc_tok = n_tok_correct / max(1, n_tok)
-    acc_edit = n_edit_correct / max(1, n_edit)
-    P = P_all / max(1, n_sent)
-    R = R_all / max(1, n_sent)
-    F = F_all / max(1, n_sent)
-
-    # 띄어쓰기 정확도(문자열 기반)
-    space_acc = _space_accuracy(all_pred_texts, all_gold_texts)
-
-    return acc_tok, acc_edit, P, R, F, space_acc
+    acc_tok = n_tok_correct / max(1,n_tok)
+    acc_edit = n_edit_correct / max(1,n_edit)
+    P = P_all / max(1,n_sent); R = R_all / max(1,n_sent); F = F_all / max(1,n_sent)
+    return acc_tok, acc_edit, P, R, F
 
 def _reconstruct_src_from_pieces(pieces: List[str]) -> str:
     s=[]
@@ -493,9 +407,6 @@ def _eta_from_pbar(pbar_start_time: float, n_done: int, total: int) -> str:
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     os.makedirs(args.outdir, exist_ok=True)
-    
-    metrics_path = os.path.join(args.outdir, "metrics.csv")
-    write_header = not os.path.exists(metrics_path)
 
     # tokenizer (convert_tokens_to_ids만 사용; 재토크나이즈 금지)
     tok = AutoTokenizer.from_pretrained(args.model, use_fast=False, trust_remote_code=True)
@@ -596,16 +507,9 @@ def train(args):
 
     best_f = -1.0
     for ep in range(1, args.epochs+1):
-        # 전체 epoch 시작 시각
-        epoch_start = time.time()
-
-        # ======================
-        # 1) Train
-        # ======================
         model.train()
         loss_sum = 0.0
-
-        train_start = time.time()  # 순수 학습 시간 측정 시작
+        t0 = time.time()
 
         # === tqdm: 학습 진행바 ===
         pbar = tqdm(train_dl, desc=f"Epoch {ep} [train]", ncols=120)
@@ -622,8 +526,7 @@ def train(args):
             loss.backward()
             # clip & grad norm
             grad_norm = float(nn.utils.clip_grad_norm_(model.parameters(), 1.0))
-            opt.step()
-            sched.step()
+            opt.step(); sched.step()
 
             loss_sum += loss.item()
 
@@ -637,17 +540,11 @@ def train(args):
                 "grad": f"{grad_norm:.2f}",
             })
 
-        train_loss = loss_sum / max(1, len(train_dl))
-        train_time = time.time() - train_start  # 순수 학습 시간
+        train_loss = loss_sum / max(1,len(train_dl))
 
-        # ======================
-        # 2) Validation (inference)
-        # ======================
+        # === tqdm: 검증 진행바 ===
         model.eval()
         val_loss_sum = 0.0
-
-        val_start = time.time()  # 순수 검증 시간 측정 시작
-
         with torch.no_grad():
             pbar_v = tqdm(valid_dl, desc=f"Epoch {ep} [valid]", ncols=120)
             pbar_v_start = time.time()
@@ -664,55 +561,13 @@ def train(args):
                     "val_loss": f"{loss.item():.4f}",
                     "eta": eta_v
                 })
-        val_loss = val_loss_sum / max(1, len(valid_dl))
+        val_loss = val_loss_sum / max(1,len(valid_dl))
 
-        # 토큰/편집/띄어쓰기 지표 계산 (inference 기준)
-        acc_tok, acc_edit, P, R, F, space_acc = evaluate(model, valid_dl, id2token, tok, device)
+        acc_tok, acc_edit, P, R, F = evaluate(model, valid_dl, id2token, tok, device)
 
-        val_time = time.time() - val_start  # 순수 검증 시간
-        epoch_time = time.time() - epoch_start  # train + val 전체 시간
-
-        print(
-            f"[Epoch {ep}] "
-            f"train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
-            f"acc_token={acc_tok:.4f} | acc_edit={acc_edit:.4f} | "
-            f"P={P:.4f} R={R:.4f} F0.5={F:.4f} | "
-            f"space_acc={space_acc:.4f} | "
-            f"train_time={train_time:.1f}s | val_time={val_time:.1f}s | total={epoch_time:.1f}s"
-        )
-
-        # === 에포크별 지표 CSV로 저장 ===
-        with open(metrics_path, "a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            if write_header:
-                writer.writerow(
-                    [
-                        "epoch",
-                        "train_loss", "val_loss",
-                        "acc_token", "acc_edit",
-                        "P", "R", "F0.5",
-                        "space_acc",
-                        "train_time_sec", "val_time_sec", "time_sec",
-                    ]
-                )
-                write_header = False
-
-            writer.writerow(
-                [
-                    ep,
-                    float(train_loss),
-                    float(val_loss),
-                    float(acc_tok),
-                    float(acc_edit),
-                    float(P),
-                    float(R),
-                    float(F),
-                    float(space_acc),
-                    float(train_time),
-                    float(val_time),
-                    float(epoch_time),
-                ]
-            )
+        print(f"[Epoch {ep}] train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
+              f"acc_token={acc_tok:.4f} | acc_edit={acc_edit:.4f} | P={P:.4f} R={R:.4f} F0.5={F:.4f} "
+              f"| time={time.time()-t0:.1f}s")
 
         # === 에폭별 무작위 프리뷰 (train/valid 각각 k개) ===
         preview_samples(model, tok, id2token, device, train_items, title="train", k=args.preview_k, max_len=args.max_len)
